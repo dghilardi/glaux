@@ -1,0 +1,6 @@
+/target/
+.env
+*.har
+*.log
+browser-profile/
+session*.json
