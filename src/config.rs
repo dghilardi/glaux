@@ -45,6 +45,8 @@ pub struct Config {
     pub headed: bool,
     pub timeout_secs: u64,
     pub browser_platform: BrowserPlatform,
+    /// Enables unattended passkey sign-in for this account; see `login.rs`.
+    pub passkey_account: Option<String>,
 }
 
 impl Config {
@@ -67,6 +69,7 @@ impl Config {
             headed,
             timeout_secs,
             browser_platform: BrowserPlatform::Auto,
+            passkey_account: None,
         })
     }
     pub fn profile(&self) -> PathBuf {

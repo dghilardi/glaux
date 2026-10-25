@@ -248,3 +248,80 @@ async fn interrupt_during_startup_closes_the_owned_browser() {
             .is_err()
     );
 }
+
+#[tokio::test]
+#[ignore = "requires Chromium; drives synthetic sign-in pages on loopback"]
+async fn passkey_driver_enters_account_and_stops_on_password() {
+    use glaux::login::{Driver, Step};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                let body = match path.split('?').next().unwrap() {
+                    "/username" => {
+                        "<input name=loginfmt><input type=button id=idSIButton9 value=Next onclick=\"location.href='/kmsi?u='+encodeURIComponent(document.querySelector('[name=loginfmt]').value)\">"
+                    }
+                    "/kmsi" => {
+                        "<input type=checkbox id=KmsiCheckboxField><input type=button id=idSIButton9 value=Yes onclick=\"location.href='/done'+location.search\">"
+                    }
+                    "/password" => {
+                        "<div id=displayName>user</div><input type=password name=passwd>"
+                    }
+                    _ => "<p>done</p>",
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::new(
+        Some(dir.path().join("driver")),
+        None,
+        DEFAULT_URL,
+        false,
+        10,
+    )
+    .unwrap();
+    let mut browser = Browser::launch(&config, false).await.unwrap();
+    let hosts = ["127.0.0.1"];
+
+    navigate(&mut browser, &format!("{base}/username")).await;
+    let mut driver = Driver::new("user@example.test");
+    let mut steps = Vec::new();
+    let finished = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let step = browser.sign_in_step(&mut driver, &hosts).await.unwrap();
+            let href = browser
+                .cdp
+                .evaluate("location.pathname + location.search")
+                .await;
+            steps.push(step);
+            if let Ok(href) = href
+                && href.as_str().unwrap_or_default().starts_with("/done")
+            {
+                return href;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(finished, json!("/done?u=user%40example.test"));
+    assert!(steps.contains(&Step::Account) && steps.contains(&Step::StaySignedIn));
+
+    navigate(&mut browser, &format!("{base}/password")).await;
+    let mut driver = Driver::new("user@example.test");
+    let error = browser.sign_in_step(&mut driver, &hosts).await.unwrap_err();
+    browser.shutdown().await;
+    server.abort();
+    assert!(error.to_string().contains("password"));
+}

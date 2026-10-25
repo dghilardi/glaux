@@ -44,6 +44,13 @@ struct Cli {
     #[arg(
         long,
         global = true,
+        env = "GLAUX_PASSKEY_ACCOUNT",
+        help = "Sign in unattended as this account with a passkey from an external authenticator"
+    )]
+    passkey_account: Option<String>,
+    #[arg(
+        long,
+        global = true,
         help = "Show the browser for mailbox commands too"
     )]
     headed: bool,
@@ -102,6 +109,13 @@ enum Commands {
     Doctor,
     /// Run a read-only MCP server over stdin/stdout. Login separately first.
     Mcp,
+    /// Run a systemd user authenticator unit only while the local session is unlocked.
+    PasskeyGuard {
+        #[arg(long, default_value = "passless.service")]
+        unit: String,
+        #[arg(long,default_value_t=2,value_parser=clap::value_parser!(u64).range(1..=60))]
+        poll: u64,
+    },
 }
 
 #[tokio::main]
@@ -129,7 +143,19 @@ async fn run(cli: Cli, json_output: bool) -> Result<()> {
         cli.timeout.unwrap_or(if login { 300 } else { 60 }),
     )?;
     config.browser_platform = cli.browser_platform;
+    config.passkey_account = cli
+        .passkey_account
+        .as_deref()
+        .map(glaux::login::validate_account)
+        .transpose()?;
     match cli.command {
+        Commands::PasskeyGuard { unit, poll } => {
+            output(
+                &glaux::guard::run(&unit, std::time::Duration::from_secs(poll)).await?,
+                json_output,
+            );
+            Ok(())
+        }
         Commands::Sync {
             config: path,
             retry_skipped,
@@ -157,7 +183,7 @@ async fn run(cli: Cli, json_output: bool) -> Result<()> {
         Commands::Doctor => {
             let browser = find_browser(config.browser.as_ref())?;
             output(
-                &json!({"browser":browser,"data_dir":config.data_dir,"profile_exists":config.profile().exists(),"owa_url":config.url.as_str(),"live_compatibility":"not checked by doctor"}),
+                &json!({"browser":browser,"data_dir":config.data_dir,"profile_exists":config.profile().exists(),"owa_url":config.url.as_str(),"passkey_sign_in":config.passkey_account.is_some(),"live_compatibility":"not checked by doctor"}),
                 json_output,
             );
             Ok(())

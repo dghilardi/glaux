@@ -504,6 +504,9 @@ pub async fn run(config: &Config, settings: &Settings, interval: Option<u64>) ->
                     return Err(error);
                 }
                 failures = failures.saturating_add(1);
+                if failures == 1 && reason == "authentication_or_protocol_required" {
+                    notify_attention().await;
+                }
                 eprintln!(
                     "{}",
                     json!({"event":"sync_failed","state":"attention_required","reason":reason,"consecutive_failures":failures})
@@ -529,11 +532,25 @@ pub async fn run(config: &Config, settings: &Settings, interval: Option<u64>) ->
     outcome
 }
 
+/// Best effort and content-free: unattended sign-in could not restore the session.
+async fn notify_attention() {
+    let run = tokio::process::Command::new("notify-send")
+        .args([
+            "--app-name=Glaux",
+            "Glaux needs Microsoft sign-in",
+            "Stop glaux.service, run `glaux login`, then start the service again.",
+        ])
+        .kill_on_drop(true)
+        .status();
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+}
+
 fn failure_reason(error: &anyhow::Error) -> &'static str {
     let description = error.to_string();
     if description.contains("No authenticated OWA")
         || description.contains("session expired")
         || description.contains("HTTP 403")
+        || description.contains("sign-in")
     {
         "authentication_or_protocol_required"
     } else if description.contains("HTTP 429") {
@@ -550,6 +567,19 @@ fn failure_reason(error: &anyhow::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn passkey_sign_in_failures_require_attention() {
+        for message in [
+            "Microsoft asked for a password; passkey sign-in needs attention, run `glaux login`",
+            "Microsoft sign-in reported an error; run `glaux login`",
+            "Passkey sign-in did not progress; run `glaux login`",
+        ] {
+            assert_eq!(
+                failure_reason(&anyhow::anyhow!(message)),
+                "authentication_or_protocol_required"
+            );
+        }
+    }
     const MIME:&[u8] = b"From: robot@example.test\r\nDate: Sun, 25 Oct 2026 10:00:00 +0000\r\nSubject: Alert synthetic\r\n\r\nBody\r\n";
     struct FakeMailbox {
         offsets: Vec<u32>,

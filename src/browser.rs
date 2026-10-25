@@ -1,6 +1,7 @@
 use crate::{
     cdp::Cdp,
     config::{Config, find_browser},
+    login::{Driver, LOGIN_HOSTS, Step},
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -170,11 +171,43 @@ impl Browser {
             .command("Page.navigate", json!({"url":config.url.as_str()}))
             .await?;
         let timeout = Duration::from_secs(config.timeout_secs);
+        let mut driver = config.passkey_account.as_deref().map(Driver::new);
         tokio::time::timeout(timeout, async {
-            while self.cdp.context.is_none() { self.cdp.receive().await?; }
+            while self.cdp.context.is_none() {
+                let Some(driver) = driver.as_mut() else {
+                    self.cdp.receive().await?;
+                    continue;
+                };
+                self.sign_in_step(driver, LOGIN_HOSTS).await?;
+            }
             Ok::<_, anyhow::Error>(())
         }).await.context("No authenticated OWA request observed. Run `glaux login` to complete sign-in/MFA; if already signed in, OWA may have changed its protocol")??;
         Ok(())
+    }
+
+    /// Pump debugger events for a second, then let the bounded driver inspect the page.
+    pub async fn sign_in_step(&mut self, driver: &mut Driver, hosts: &[&str]) -> Result<Step> {
+        let pause = Instant::now() + Duration::from_secs(1);
+        while self.cdp.context.is_none() {
+            match tokio::time::timeout_at(pause, self.cdp.receive()).await {
+                Ok(event) => {
+                    event?;
+                }
+                Err(_) => break,
+            }
+        }
+        if self.cdp.context.is_some() {
+            return Ok(Step::Elsewhere);
+        }
+        // Navigation can destroy the evaluation context: that is progress, not failure.
+        let Ok(value) = self
+            .cdp
+            .evaluate(&driver.script(Instant::now().into_std(), hosts))
+            .await
+        else {
+            return Ok(Step::Waiting);
+        };
+        driver.record(&value, Instant::now().into_std())
     }
 
     pub async fn shutdown(mut self) {

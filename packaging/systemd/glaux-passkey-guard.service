@@ -1,0 +1,14 @@
+[Unit]
+Description=Glaux: run the passkey authenticator only while the session is unlocked
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/glaux passkey-guard --unit passless.service
+UMask=0077
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

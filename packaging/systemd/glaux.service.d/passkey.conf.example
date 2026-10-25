@@ -1,0 +1,6 @@
+# Copy to ~/.config/systemd/user/glaux.service.d/passkey.conf and set your account.
+# Unattended sign-in needs more than the default 60 seconds: TPM passkeys are slow.
+[Service]
+Environment=GLAUX_PASSKEY_ACCOUNT=user@example.com
+ExecStart=
+ExecStart=%h/.cargo/bin/glaux daemon --config %h/.config/glaux/sync.toml --interval 300 --timeout 180

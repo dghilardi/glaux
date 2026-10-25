@@ -3,6 +3,8 @@ pub mod browser;
 pub mod cdp;
 pub mod config;
 pub mod export;
+pub mod guard;
+pub mod login;
 pub mod mcp;
 pub mod owa;
 pub mod shutdown;
