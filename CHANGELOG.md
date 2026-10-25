@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.0] 2026-10-25
+
 ### Added
 
 - Local archive reprocessing with dry runs, queued daemon requests and aggregate status reports.
