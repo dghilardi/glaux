@@ -1,0 +1,11 @@
+[vcs]
+software = "Git"
+tag_template = "v{{version}}"
+
+[vcs.strict]
+mainline = "main"
+
+[modules.glaux]
+path = "."
+packageManager = "Cargo"
+main = true

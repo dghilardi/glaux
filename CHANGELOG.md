@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- `just release patch|minor|major` to cut releases with panrelease.
+
 ## [0.1.0] - 2026-10-25
 
 ### Added
