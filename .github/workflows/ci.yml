@@ -1,5 +1,9 @@
 name: Rust
-on: [push, pull_request]
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
 jobs:
   checks:
     runs-on: ubuntu-latest

@@ -31,7 +31,7 @@ Glaux never sees your password and never writes tokens to disk. Session lifetime
 ## Install
 
 ```bash
-cargo install --git https://github.com/dghilardi/glaux --locked
+cargo install glaux --locked
 glaux doctor
 glaux login
 glaux list --limit 10

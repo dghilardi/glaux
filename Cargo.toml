@@ -9,7 +9,7 @@ repository = "https://github.com/dghilardi/glaux"
 readme = "README.md"
 keywords = ["email", "outlook", "microsoft-365", "mcp", "cli"]
 categories = ["command-line-utilities", "email"]
-publish = false
+exclude = [".github/", "AGENTS.md", "scripts/", "tests/test_validate_live.py"]
 
 [[bin]]
 name = "glaux"

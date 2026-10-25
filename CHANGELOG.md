@@ -4,7 +4,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-25
+
 ### Added
+
+- Publishing to crates.io from CI on version tags.
 
 - Optional unattended passkey sign-in (`--passkey-account`) and `passkey-guard` to run the authenticator only while the session is unlocked.
 - Desktop notification when the daemon needs a new sign-in.
