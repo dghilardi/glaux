@@ -13,20 +13,23 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 directories = "6"
 fs2 = "0.4"
 futures-util = { version = "0.3", features = ["sink"] }
+mailparse = "0.16"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 rmcp = { version = "3.7", features = ["server", "transport-io", "schemars"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+toml = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "signal", "io-util", "io-std", "sync"] }
 tokio-tungstenite = "0.30"
 url = "2"
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 lto = "thin"

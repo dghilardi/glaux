@@ -1,6 +1,7 @@
 pub mod browser;
 pub mod cdp;
 pub mod config;
+pub mod export;
 pub mod mcp;
 pub mod owa;
 
@@ -15,6 +16,10 @@ pub enum Operation {
     },
     Read {
         id: String,
+    },
+    Export {
+        id: String,
+        output: std::path::PathBuf,
     },
     Status,
 }
@@ -33,6 +38,10 @@ pub async fn execute(config: &config::Config, operation: Operation) -> Result<Va
         Operation::Read { id } => {
             owa::read_request(id)?;
         }
+        Operation::Export { id, output } => {
+            owa::mime_request(id)?;
+            export::validate_output(output)?;
+        }
         Operation::Status => {}
     }
     let mut browser = browser::Browser::launch(config, config.headed).await?;
@@ -42,6 +51,11 @@ pub async fn execute(config: &config::Config, operation: Operation) -> Result<Va
             match operation {
                 Operation::List { folder, limit, offset } => Ok(serde_json::to_value(owa::list(&mut browser, config, &folder, limit, offset).await?)?),
                 Operation::Read { id } => Ok(serde_json::to_value(owa::read(&mut browser, config, &id).await?)?),
+                Operation::Export { id, output } => {
+                    let bytes = owa::read_mime(&mut browser, config, &id).await?;
+                    export::publish(&output, &bytes)?;
+                    Ok(json!({"exported":true,"bytes":bytes.len(),"format":"eml"}))
+                },
                 Operation::Status => {
                     // Observing a bearer alone isn't proof that mailbox reads work.
                     owa::list(&mut browser, config, "inbox", 1, 0).await?;

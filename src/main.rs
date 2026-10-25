@@ -76,6 +76,12 @@ enum Commands {
     },
     /// Read a message by its full OWA ItemId; requests plain text.
     Read { id: String },
+    /// Export one server-provided MIME message, including MIME attachments when available.
+    Export {
+        id: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Remove the local Glaux browser profile. Does not revoke server-side sessions.
     Logout,
     /// Show local configuration diagnostics without signing in.
@@ -147,6 +153,7 @@ async fn run(cli: Cli, json_output: bool) -> Result<()> {
                     offset,
                 },
                 Commands::Read { id } => Operation::Read { id },
+                Commands::Export { id, output } => Operation::Export { id, output },
                 _ => unreachable!(),
             };
             let value = execute(&config, operation).await?;

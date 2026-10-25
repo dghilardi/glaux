@@ -1,6 +1,7 @@
 //! OWA's internal JSON protocol, not EWS SOAP or Graph. Payloads are isolated here.
 use crate::{browser::Browser, config::Config};
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -86,6 +87,55 @@ pub fn read_request(id: &str) -> Result<Value> {
             "ItemIds":[{"__type":"ItemId:#Exchange","Id":id}]
         }),
     ))
+}
+
+pub fn mime_request(id: &str) -> Result<Value> {
+    let mut payload = read_request(id)?;
+    payload["Body"]["ItemShape"] = json!({
+        "__type":"ItemResponseShape:#Exchange", "BaseShape":"IdOnly", "IncludeMimeContent":true
+    });
+    Ok(payload)
+}
+
+/// Export the server's MIME representation, never synthesize an incomplete .eml.
+pub async fn read_mime(browser: &mut Browser, config: &Config, id: &str) -> Result<Vec<u8>> {
+    let response = request(browser, config, "GetItem", mime_request(id)?).await?;
+    parse_mime(&response, id)
+}
+
+fn parse_mime(response: &Value, id: &str) -> Result<Vec<u8>> {
+    let item = response_messages(response)?
+        .first()
+        .and_then(|m| m["Items"].as_array())
+        .and_then(|items| items.first())
+        .context("OWA returned no MIME item")?;
+    if item.pointer("/ItemId/Id").and_then(Value::as_str) != Some(id) {
+        bail!("OWA returned a different MIME item");
+    }
+    let content = item
+        .pointer("/MimeContent/Value")
+        .or_else(|| item.get("MimeContent"))
+        .and_then(Value::as_str)
+        .context("OWA did not return MIME content; export compatibility needs checking")?;
+    let bytes = STANDARD
+        .decode(content)
+        .map_err(|_| anyhow::anyhow!("Invalid OWA MIME encoding"))?;
+    validate_mime(&bytes)?;
+    Ok(bytes)
+}
+
+pub fn validate_mime(bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 {
+        bail!("MIME export must contain 1 byte to 10 MiB");
+    }
+    let mail = mailparse::parse_mail(bytes).map_err(|_| anyhow::anyhow!("Invalid MIME message"))?;
+    use mailparse::MailHeaderMap;
+    if mail.headers.get_first_value("From").is_none()
+        || mail.headers.get_first_value("Date").is_none()
+    {
+        bail!("MIME export lacks required message headers");
+    }
+    Ok(())
 }
 
 /// Never exposes a general-purpose action, arbitrary URL or JavaScript through MCP.
@@ -278,6 +328,17 @@ fn parse_mail(item: &Value) -> Result<Mail> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mime_export_preserves_bytes_and_does_not_change_read_state() {
+        let bytes = b"From: sender@example.test\r\nDate: Sun, 25 Oct 2026 10:00:00 +0000\r\nSubject: synthetic\r\n\r\nBody\r\n";
+        let response = json!({"Body":{"ResponseMessages":{"Items":[{"ResponseClass":"Success","Items":[{"ItemId":{"Id":"fixture"},"MimeContent":{"Value":STANDARD.encode(bytes)}}]}]}}});
+        assert_eq!(parse_mime(&response, "fixture").unwrap(), bytes);
+        assert!(parse_mime(&response, "different").is_err());
+        let request = mime_request("fixture").unwrap();
+        assert_eq!(request["Body"]["ItemShape"]["IncludeMimeContent"], true);
+        assert!(request["Body"].get("IsRead").is_none());
+        assert!(validate_mime(b"not a message").is_err());
+    }
     #[test]
     fn parses_paging_sender_and_opaque_ids() {
         let fixture = json!({"Body":{"ResponseMessages":{"Items":[{"ResponseClass":"Success","ResponseCode":"NoError","RootFolder":{
