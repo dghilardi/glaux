@@ -6,6 +6,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Opt-in per-category retention for the local archive (`[retention]` in the sync configuration); expired copies are not downloaded again.
 - `just release patch|minor|major` to cut releases with panrelease.
 
 ## [0.1.0] - 2026-10-25

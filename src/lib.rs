@@ -7,6 +7,7 @@ pub mod guard;
 pub mod login;
 pub mod mcp;
 pub mod owa;
+pub mod retention;
 pub mod shutdown;
 
 use anyhow::Result;

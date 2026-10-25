@@ -3,6 +3,7 @@ use crate::{
     browser::Browser,
     config::{Config, private_dir},
     export, owa,
+    retention::{self, Retention},
     shutdown::Shutdown,
 };
 use anyhow::{Context, Result, ensure};
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -28,6 +30,8 @@ pub struct Settings {
     pub max_pages: u32,
     pub rules: Vec<Rule>,
     pub retry_skipped: bool,
+    /// Local copies of these categories are deleted after the period; off by default.
+    pub retention: BTreeMap<String, Retention>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -47,6 +51,7 @@ impl Default for Settings {
             max_pages: 10,
             rules: Vec::new(),
             retry_skipped: false,
+            retention: BTreeMap::new(),
         }
     }
 }
@@ -76,6 +81,9 @@ impl Settings {
             (1..=1000).contains(&self.max_pages),
             "max_pages must be 1..1000"
         );
+        for category in self.retention.keys() {
+            retention::validate(category)?;
+        }
         for rule in &self.rules {
             ensure!(
                 !rule.category.is_empty()
@@ -114,6 +122,28 @@ impl Settings {
         }
         Ok("other".into())
     }
+}
+
+/// Fallback age for rows archived before server times were recorded.
+fn date_header(path: &Path) -> Option<i64> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > 10 * 1024 * 1024 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let date = mailparse::parse_headers(&bytes)
+        .ok()
+        .and_then(|(headers, _)| headers.get_first_value("Date"))
+        .and_then(|date| mailparse::dateparse(&date).ok());
+    let modified = || {
+        let since = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        i64::try_from(since.as_secs()).ok()
+    };
+    date.or_else(modified)
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -180,7 +210,7 @@ impl Archive {
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         database.busy_timeout(Duration::from_secs(5))?;
         let version: u32 = database.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(version <= 1, "Unsupported archive schema");
+        ensure!(version <= 2, "Unsupported archive schema");
         if version == 0 {
             let count: u32 = database.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], |r| r.get(0))?;
             ensure!(count == 0, "Refusing unrelated archive database");
@@ -193,6 +223,10 @@ impl Archive {
         )?;
         ensure!(own_schema == 1, "Refusing unrelated archive database");
         database.execute_batch("PRAGMA synchronous=FULL;")?;
+        if version <= 1 {
+            // Rows archived before v2 have no server time; expiry falls back to the Date header.
+            database.execute_batch("BEGIN IMMEDIATE; ALTER TABLE glaux_messages ADD COLUMN received_unix INTEGER; ALTER TABLE glaux_messages ADD COLUMN expired_at INTEGER; PRAGMA user_version=2; COMMIT;")?;
+        }
         database.execute_batch("CREATE TABLE IF NOT EXISTS glaux_scan(folder TEXT PRIMARY KEY,next_offset INTEGER NOT NULL);")?;
         database.execute_batch("CREATE TABLE IF NOT EXISTS glaux_skipped(owa_id TEXT PRIMARY KEY,reason TEXT NOT NULL);")?;
         if settings.retry_skipped {
@@ -206,17 +240,21 @@ impl Archive {
     }
 
     pub fn contains(&self, id: &str) -> Result<bool> {
-        let row: Option<(String, String)> = self
+        let row: Option<(String, String, Option<i64>)> = self
             .database
             .query_row(
-                "SELECT relative_path,sha256 FROM glaux_messages WHERE owa_id=?1",
+                "SELECT relative_path,sha256,expired_at FROM glaux_messages WHERE owa_id=?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((relative, checksum)) = row else {
+        let Some((relative, checksum, expired)) = row else {
             return Ok(false);
         };
+        // Expired by retention: keep it out of the archive instead of downloading it again.
+        if expired.is_some() {
+            return Ok(true);
+        }
         ensure!(
             Path::new(&relative)
                 .components()
@@ -239,7 +277,13 @@ impl Archive {
         Ok(true)
     }
 
-    pub fn store(&self, settings: &Settings, id: &str, bytes: &[u8]) -> Result<()> {
+    pub fn store(
+        &self,
+        settings: &Settings,
+        id: &str,
+        bytes: &[u8],
+        received_unix: Option<i64>,
+    ) -> Result<()> {
         owa::validate_mime(bytes)?;
         let category = settings.category(bytes)?;
         let checksum = digest(bytes);
@@ -264,8 +308,59 @@ impl Archive {
         }
         // An identical export repairs a publication without a state row. A server-regenerated
         // MIME representation can leave an orphan with different bytes after a crash.
-        self.database.execute("INSERT INTO glaux_messages VALUES(?1,?2,?3) ON CONFLICT(owa_id) DO UPDATE SET relative_path=excluded.relative_path,sha256=excluded.sha256", params![id,relative,checksum])?;
+        self.database.execute("INSERT INTO glaux_messages(owa_id,relative_path,sha256,received_unix,expired_at) VALUES(?1,?2,?3,?4,NULL) ON CONFLICT(owa_id) DO UPDATE SET relative_path=excluded.relative_path,sha256=excluded.sha256,received_unix=excluded.received_unix,expired_at=NULL", params![id,relative,checksum,received_unix])?;
         Ok(())
+    }
+
+    /// Delete local copies older than their category's retention; returns how many expired.
+    pub fn expire(&self, settings: &Settings, now_unix: i64) -> Result<u32> {
+        let mut expired = 0;
+        for (category, retention) in &settings.retention {
+            let prefix = format!("messages/{category}/");
+            let cutoff = retention.cutoff(now_unix);
+            let rows: Vec<(String, String, Option<i64>)> = self
+                .database
+                .prepare("SELECT owa_id,relative_path,received_unix FROM glaux_messages WHERE expired_at IS NULL AND substr(relative_path,1,length(?1))=?1 AND (received_unix IS NULL OR received_unix<?2)")?
+                .query_map(params![prefix, cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (id, relative, received) in rows {
+                let path = self.root.join(&relative);
+                let received = match received {
+                    Some(received) => received,
+                    None => match date_header(&path) {
+                        Some(date) => {
+                            self.database.execute(
+                                "UPDATE glaux_messages SET received_unix=?2 WHERE owa_id=?1",
+                                params![id, date],
+                            )?;
+                            date
+                        }
+                        None => continue,
+                    },
+                };
+                if received >= cutoff {
+                    continue;
+                }
+                self.database.execute(
+                    "UPDATE glaux_messages SET expired_at=?2 WHERE owa_id=?1",
+                    params![id, now_unix],
+                )?;
+                // Identical messages share one file: keep it while any copy is still live.
+                let live: bool = self.database.query_row("SELECT EXISTS(SELECT 1 FROM glaux_messages WHERE relative_path=?1 AND expired_at IS NULL)", [&relative], |r| r.get(0))?;
+                if !live
+                    && Path::new(&relative)
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_)))
+                {
+                    match std::fs::symlink_metadata(&path) {
+                        Ok(meta) if meta.is_file() => std::fs::remove_file(&path)?,
+                        _ => {}
+                    }
+                }
+                expired += 1;
+            }
+        }
+        Ok(expired)
     }
 
     fn health(&self, value: &Value) -> Result<()> {
@@ -330,6 +425,7 @@ pub struct Report {
     pub scan_complete: bool,
     pub resume_offset: u32,
     pub skipped: u32,
+    pub expired: u32,
 }
 
 trait Mailbox {
@@ -400,7 +496,11 @@ async fn cycle(
                     return Err(error);
                 }
             };
-            archive.store(settings, &message.id, &bytes)?;
+            let received = message
+                .received_at
+                .as_deref()
+                .and_then(retention::parse_received);
+            archive.store(settings, &message.id, &bytes, received)?;
             consecutive_errors = 0;
             report.downloaded += 1;
             report.bytes += bytes.len() as u64;
@@ -439,6 +539,8 @@ async fn cycle(
     for (id, reason) in pending_skips {
         archive.skip(&id, &reason)?;
     }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    report.expired = archive.expire(settings, i64::try_from(now.as_secs())?)?;
     Ok(report)
 }
 
@@ -607,7 +709,7 @@ mod tests {
             ..Default::default()
         };
         let archive = Archive::open(&settings).unwrap();
-        archive.store(&settings, "item-2", MIME).unwrap();
+        archive.store(&settings, "item-2", MIME, None).unwrap();
         archive.advance("inbox", 5).unwrap();
         let mut fake = FakeMailbox {
             offsets: vec![],
@@ -782,8 +884,8 @@ mod tests {
         };
         let archive = Archive::open(&settings).unwrap();
         assert!(Archive::open(&settings).is_err());
-        archive.store(&settings, "owa-1", MIME).unwrap();
-        archive.store(&settings, "owa-2", MIME).unwrap();
+        archive.store(&settings, "owa-1", MIME, None).unwrap();
+        archive.store(&settings, "owa-2", MIME, None).unwrap();
         assert!(archive.contains("owa-1").unwrap());
         let path = settings
             .archive_dir
@@ -797,13 +899,130 @@ mod tests {
             .database
             .execute("DELETE FROM glaux_messages", [])
             .unwrap();
-        archive.store(&settings, "owa-1", MIME).unwrap();
+        archive.store(&settings, "owa-1", MIME, None).unwrap();
         assert!(archive.contains("owa-1").unwrap());
         std::fs::remove_file(&path).unwrap();
         assert!(!archive.contains("owa-1").unwrap());
-        archive.store(&settings, "owa-1", MIME).unwrap();
+        archive.store(&settings, "owa-1", MIME, None).unwrap();
         std::fs::write(&path, b"tampered").unwrap();
         assert!(archive.contains("owa-1").is_err());
+    }
+    #[test]
+    fn retention_expires_local_copies_and_keeps_tombstones() {
+        const NEW: &[u8] = b"From: robot@example.test\r\nDate: Sun, 25 Oct 2026 11:00:00 +0000\r\nSubject: Alert newer\r\n\r\nBody\r\n";
+        const NOTE: &[u8] = b"From: colleague@example.test\r\nDate: Sun, 25 Oct 2026 12:00:00 +0000\r\nSubject: Note\r\n\r\nBody\r\n";
+        let dir = tempfile::tempdir().unwrap();
+        let settings: Settings = toml::from_str(&format!(
+            "archive_dir = {:?}\n[[rules]]\ncategory = \"alerts\"\nheader = \"subject\"\ncontains = \"alert\"\n[retention]\nalerts = \"10d\"\n",
+            dir.path().join("archive")
+        ))
+        .unwrap();
+        settings.validate().unwrap();
+        let archive = Archive::open(&settings).unwrap();
+        let now = 2_000_000_000;
+        let old = now - 11 * 86_400;
+        archive.store(&settings, "old", MIME, Some(old)).unwrap();
+        archive
+            .store(&settings, "old-duplicate", MIME, Some(now))
+            .unwrap();
+        archive
+            .store(&settings, "new", NEW, Some(now - 86_400))
+            .unwrap();
+        archive.store(&settings, "note", NOTE, Some(old)).unwrap();
+        let shared = settings
+            .archive_dir
+            .join(format!("messages/alerts/{}.eml", digest(MIME)));
+
+        assert_eq!(archive.expire(&settings, now).unwrap(), 1);
+        assert!(shared.exists(), "a live duplicate keeps the shared file");
+        archive
+            .database
+            .execute(
+                "UPDATE glaux_messages SET received_unix=?1 WHERE owa_id='old-duplicate'",
+                [old],
+            )
+            .unwrap();
+        assert_eq!(archive.expire(&settings, now).unwrap(), 1);
+        assert!(!shared.exists());
+        assert!(
+            archive.contains("old").unwrap(),
+            "expired messages are not downloaded again"
+        );
+        assert!(archive.contains("new").unwrap());
+        assert!(
+            archive.contains("note").unwrap(),
+            "categories without retention are kept"
+        );
+        assert_eq!(archive.expire(&settings, now).unwrap(), 0);
+    }
+    #[test]
+    fn legacy_archive_is_migrated_and_aged_by_date_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings {
+            archive_dir: dir.path().join("archive"),
+            rules: vec![Rule {
+                category: "alerts".into(),
+                header: "subject".into(),
+                contains: "alert".into(),
+            }],
+            ..Default::default()
+        };
+        std::fs::create_dir_all(settings.archive_dir.join("messages/alerts")).unwrap();
+        let relative = format!("messages/alerts/{}.eml", digest(MIME));
+        std::fs::write(settings.archive_dir.join(&relative), MIME).unwrap();
+        let legacy = Connection::open(settings.archive_dir.join("state.sqlite3")).unwrap();
+        legacy.execute_batch("CREATE TABLE glaux_messages(owa_id TEXT PRIMARY KEY, relative_path TEXT NOT NULL, sha256 TEXT NOT NULL); PRAGMA user_version=1;").unwrap();
+        legacy
+            .execute(
+                "INSERT INTO glaux_messages VALUES('legacy',?1,?2)",
+                params![relative, digest(MIME)],
+            )
+            .unwrap();
+        drop(legacy);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let state = settings.archive_dir.join("state.sqlite3");
+            std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        settings
+            .retention
+            .insert("alerts".into(), Retention { days: 10 });
+        let archive = Archive::open(&settings).unwrap();
+        let version: u32 = archive
+            .database
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        // The fixture Date header is 2026-10-25 10:00 UTC.
+        assert_eq!(
+            archive
+                .expire(&settings, 1_792_922_400 + 9 * 86_400)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            archive
+                .expire(&settings, 1_792_922_400 + 11 * 86_400)
+                .unwrap(),
+            1
+        );
+        assert!(archive.contains("legacy").unwrap());
+        assert!(!settings.archive_dir.join(relative).exists());
+    }
+    #[test]
+    fn retention_configuration_is_validated() {
+        for raw in [
+            "[retention]\nalerts = \"10\"\n",
+            "[retention]\nalerts = 10\n",
+            "[retention]\n\"../x\" = \"10d\"\n",
+        ] {
+            let parsed = toml::from_str::<Settings>(&format!("archive_dir = \"/tmp/a\"\n{raw}"));
+            assert!(
+                parsed.is_err() || parsed.unwrap().validate().is_err(),
+                "{raw:?}"
+            );
+        }
     }
     #[test]
     fn configuration_and_payload_are_validated_before_publication() {
@@ -820,7 +1039,7 @@ mod tests {
         assert!(settings.validate().is_err());
         settings.rules.clear();
         let archive = Archive::open(&settings).unwrap();
-        assert!(archive.store(&settings, "id", b"not mail").is_err());
+        assert!(archive.store(&settings, "id", b"not mail", None).is_err());
         assert!(!archive.contains("id").unwrap());
     }
 }

@@ -99,7 +99,7 @@ glaux sync --config /absolute/path/sync.toml
 glaux daemon --config /absolute/path/sync.toml --interval 300
 ```
 
-`sync` downloads new messages of one remote folder as `messages/<category>/<sha256>.eml` under a private archive directory, with categories assigned by simple header rules ([sync.example.toml](sync.example.toml)). A SQLite state file tracks OWA IDs, checksums and a backfill cursor; `status.json` holds only state and counts. Files are published atomically, verified by checksum and never deleted automatically. Categories are local folders: nothing is moved on the server. Header rules do not prove sender identity.
+`sync` downloads new messages of one remote folder as `messages/<category>/<sha256>.eml` under a private archive directory, with categories assigned by simple header rules ([sync.example.toml](sync.example.toml)). A SQLite state file tracks OWA IDs, checksums and a backfill cursor; `status.json` holds only state and counts. Files are published atomically and verified by checksum. They are kept forever unless you set a per-category `[retention]` such as `alerts = "10d"`: after each cycle, local copies older than that (by server receive time) are deleted and remembered, so they are not downloaded again. Retention never touches the server. Categories are local folders: nothing is moved on the server. Header rules do not prove sender identity.
 
 `daemon` polls on an interval, keeps its browser open between successful cycles and backs off after errors, recording a content-free `reason` in `status.json`. On Linux a systemd user unit is provided in [packaging/systemd](packaging/systemd):
 

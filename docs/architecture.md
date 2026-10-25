@@ -10,7 +10,8 @@ A single Rust package provides the `glaux` library and binary. The CLI and the M
 - `cdp.rs`: sequential CDP websocket, response correlation and observation of OWA request headers. A context is accepted only from a successful response on the exact `/owa/service.svc` path; `requestWillBeSentExtraInfo` may arrive before or after the request and response.
 - `owa.rs`: `FindItem`/`GetItem` payloads, in-page fetch transport and response normalization.
 - `export.rs`: atomic, non-overwriting publication of private EML files; the MIME comes from the server.
-- `archive.rs`: local classification rules, archive integrity, SQLite state, backfill cursor, explicit per-item exclusions and polling with backoff.
+- `archive.rs`: local classification rules, archive integrity, SQLite state, backfill cursor, explicit per-item exclusions, opt-in retention and polling with backoff.
+- `retention.rs`: retention periods and parsing of OWA receive times.
 - `login.rs`: optional passkey sign-in; bounded actions on Microsoft sign-in hosts only, no secrets handled by Glaux.
 - `guard.rs`: starts and stops a systemd authenticator unit based on the `loginctl` session state.
 - `lib.rs`: input validation, authentication, the operation itself and cleanup on errors or Ctrl-C.

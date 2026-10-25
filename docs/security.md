@@ -22,7 +22,7 @@ The optional [passkey sign-in](passkey.md) lets Glaux repeat sign-in without int
 
 ## Mail and MCP
 
-`export`, `sync` and `daemon` intentionally keep local EML copies, including attachments when present in the server's MIME. The archive is separate from the profile and is not removed by `logout`. SQLite holds OWA IDs, relative paths and checksums; `status.json` and the daemon journal contain only states and counts. Local rules read unverified headers.
+`export`, `sync` and `daemon` intentionally keep local EML copies, including attachments when present in the server's MIME. The archive is separate from the profile and is not removed by `logout`. Optional retention deletes local copies only; deletion is not secure erasure. SQLite holds OWA IDs, relative paths, checksums, receive times and expiry markers; `status.json` and the daemon journal contain only states and counts. Local rules read unverified headers.
 
 The code issues only `FindItem` and `GetItem`. It never sends read-state updates, replies, deletions or messages. Outlook itself may still issue bootstrap, telemetry and sync requests. Reads request plain text, do not load remote images in the terminal and strip control and bidi characters from human output.
 
