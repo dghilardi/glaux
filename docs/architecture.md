@@ -12,6 +12,7 @@ A single Rust package provides the `glaux` library and binary. The CLI and the M
 - `export.rs`: atomic, non-overwriting publication of private EML files; the MIME comes from the server.
 - `archive.rs`: local classification rules, archive integrity, SQLite state, backfill cursor, explicit per-item exclusions, opt-in retention and polling with backoff.
 - `retention.rs`: retention periods and parsing of OWA receive times.
+- `reprocess.rs`: private durable rule snapshots and aggregate results for reclassification by the archive owner; no browser or additional archive owner.
 - `login.rs`: optional passkey sign-in; bounded actions on Microsoft sign-in hosts only, no secrets handled by Glaux.
 - `guard.rs`: starts and stops a systemd authenticator unit based on the `loginctl` session state.
 - `lib.rs`: input validation, authentication, the operation itself and cleanup on errors or Ctrl-C.
@@ -37,6 +38,6 @@ Authentication depends on an external Chromium. Every command reloads the web ap
 
 Glaux does not use EWS SOAP, Microsoft Graph, the deprecated Outlook REST API or client IDs of other applications. The OWA payload version and UTC time zone are fixed by Glaux and not copied from the web app's own requests.
 
-The EML archive is an explicit `sync`/`daemon` feature, separate from the browser profile. The daemon keeps its browser open while polling. There are no extra heartbeats to stretch the session and no application telemetry; Chromium and Outlook keep their own network behaviour.
+The EML archive is an explicit `sync`/`daemon` feature, separate from the browser profile. The daemon keeps its browser open while polling. It consumes local reprocessing requests between cycles and during backoff. Reclassification publishes verified copies before updating SQLite, records cleanup durably and preserves receive times and expired tombstones; it does not run retention. Successful requests also replace the active classification rules. There are no extra heartbeats to stretch the session and no application telemetry; Chromium and Outlook keep their own network behaviour.
 
 Shutdown uses a separate CDP connection to the browser target, validated against the same loopback port, so it works even if the observed page has detached. A forced kill after a timeout prints a generic persistence warning.

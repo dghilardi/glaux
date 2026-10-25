@@ -103,6 +103,21 @@ enum Commands {
         #[arg(long,default_value_t=300,value_parser=clap::value_parser!(u64).range(30..=86400))]
         interval: u64,
     },
+    /// Reclassify downloaded EML files; queue work for the daemon by default.
+    Reprocess {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, conflicts_with = "status")]
+        dry_run: bool,
+        #[arg(
+            long,
+            conflicts_with = "status",
+            help = "Run offline here; the archive must be idle"
+        )]
+        local: bool,
+        #[arg(long, help = "Show the pending request and latest aggregate result")]
+        status: bool,
+    },
     /// Remove the local Glaux browser profile. Does not revoke server-side sessions.
     Logout,
     /// Show local configuration diagnostics without signing in.
@@ -177,6 +192,23 @@ async fn run(cli: Cli, json_output: bool) -> Result<()> {
                 &glaux::archive::run(&config, &settings, Some(interval)).await?,
                 json_output,
             );
+            Ok(())
+        }
+        Commands::Reprocess {
+            config: path,
+            dry_run,
+            local,
+            status,
+        } => {
+            let settings = glaux::archive::Settings::load(path.as_deref(), &config)?;
+            let value = if status {
+                glaux::reprocess::status(&settings)?
+            } else if local {
+                serde_json::to_value(glaux::reprocess::local(&settings, dry_run)?)?
+            } else {
+                glaux::reprocess::request(&settings, dry_run)?
+            };
+            output(&value, json_output);
             Ok(())
         }
         Commands::Mcp => glaux::mcp::serve(config).await,

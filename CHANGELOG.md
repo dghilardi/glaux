@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Local archive reprocessing with dry runs, queued daemon requests and aggregate status reports.
+
 - More specific archive classification with optional exact senders and separate example rules for monitoring, administration, development notifications and calendar messages.
 
 - Opt-in per-category retention for the local archive (`[retention]` in the sync configuration); expired copies are not downloaded again.

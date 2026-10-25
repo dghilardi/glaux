@@ -93,3 +93,90 @@ async fn mcp_stdio_discovery_and_errors_without_opening_browser() {
         child.wait().await.unwrap();
     }).await.unwrap();
 }
+
+#[tokio::test]
+async fn reprocess_local_and_queue_commands_do_not_launch_a_browser() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = glaux::archive::Settings {
+        archive_dir: directory.path().join("archive"),
+        ..Default::default()
+    };
+    let archive = glaux::archive::Archive::open(&settings).unwrap();
+    archive.store(&settings, "synthetic", b"From: robot@example.test\r\nDate: Sun, 25 Oct 2026 10:00:00 +0000\r\nSubject: Prometheus synthetic\r\n\r\nBody\r\n", None).unwrap();
+    drop(archive);
+    let path = directory.path().join("sync.toml");
+    std::fs::write(&path, format!("archive_dir = {:?}\n[[rules]]\ncategory = 'monitoring'\nheader = 'subject'\ncontains = 'prometheus'\n", settings.archive_dir)).unwrap();
+    let data = directory.path().join("data");
+    for flags in [
+        vec!["--local", "--dry-run"],
+        vec!["--local"],
+        vec!["--dry-run"],
+        vec!["--status"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_glaux"))
+            .arg("--data-dir")
+            .arg(&data)
+            .args(["--browser", "/bin/false", "reprocess", "--config"])
+            .arg(&path)
+            .args(&flags)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["ok"], true);
+        if flags.contains(&"--local") {
+            assert_eq!(response["data"]["moved"], 1);
+        }
+        assert!(
+            !data.exists(),
+            "local commands must not create browser state"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_handles_reprocess_requests_during_browser_failure_backoff() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = glaux::archive::Settings { archive_dir: directory.path().join("archive"), ..Default::default() };
+        let archive = glaux::archive::Archive::open(&settings).unwrap();
+        archive.store(&settings, "synthetic", b"From: robot@example.test\r\nDate: Sun, 25 Oct 2026 10:00:00 +0000\r\nSubject: Prometheus synthetic\r\n\r\nBody\r\n", None).unwrap();
+        drop(archive);
+        let path = directory.path().join("sync.toml");
+        std::fs::write(&path, format!("archive_dir = {:?}\n", settings.archive_dir)).unwrap();
+        let mut daemon = Command::new(env!("CARGO_BIN_EXE_glaux"))
+            .arg("--data-dir").arg(directory.path().join("data"))
+            .args(["--browser", "/bin/false", "daemon", "--interval", "30", "--config"])
+            .arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+        loop {
+            if settings.archive_dir.join("status.json").exists() { break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let proposed = glaux::archive::Settings {
+            rules: vec![glaux::archive::Rule { category: "monitoring".into(), header: "subject".into(), contains: "prometheus".into(), ..Default::default() }],
+            ..settings.clone()
+        };
+        assert!(glaux::archive::Archive::open(&settings).is_err(), "daemon owns the archive");
+        glaux::reprocess::request(&proposed, false).unwrap();
+        loop {
+            let result = glaux::reprocess::status(&proposed).unwrap();
+            if result["last_result"]["state"] == "completed" && result["pending"] == false {
+                assert_eq!(result["last_result"]["report"]["moved"], 1);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let signal = Command::new("kill").args(["-TERM", &daemon.id().unwrap().to_string()]).status().await.unwrap();
+        assert!(signal.success());
+        assert!(daemon.wait().await.unwrap().success());
+        let archive = glaux::archive::Archive::open(&proposed).unwrap();
+        assert!(archive.contains("synthetic").unwrap());
+        assert_eq!(std::fs::read_dir(settings.archive_dir.join("messages/monitoring")).unwrap().count(), 1);
+    }).await.unwrap();
+}

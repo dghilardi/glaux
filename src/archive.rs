@@ -264,6 +264,7 @@ impl Archive {
             // Rows archived before v2 have no server time; expiry falls back to the Date header.
             database.execute_batch("BEGIN IMMEDIATE; ALTER TABLE glaux_messages ADD COLUMN received_unix INTEGER; ALTER TABLE glaux_messages ADD COLUMN expired_at INTEGER; PRAGMA user_version=2; COMMIT;")?;
         }
+        database.execute_batch("CREATE TABLE IF NOT EXISTS glaux_reprocess_cleanup(relative_path TEXT PRIMARY KEY,sha256 TEXT NOT NULL);")?;
         database.execute_batch("CREATE TABLE IF NOT EXISTS glaux_scan(folder TEXT PRIMARY KEY,next_offset INTEGER NOT NULL);")?;
         database.execute_batch("CREATE TABLE IF NOT EXISTS glaux_skipped(owa_id TEXT PRIMARY KEY,reason TEXT NOT NULL);")?;
         if settings.retry_skipped {
@@ -324,7 +325,15 @@ impl Archive {
         owa::validate_mime(bytes)?;
         let category = settings.category(bytes)?;
         let checksum = digest(bytes);
-        let directory = self.root.join("messages").join(&category);
+        let relative = self.publish_message(&category, &checksum, bytes)?;
+        // An identical export repairs a publication without a state row. A server-regenerated
+        // MIME representation can leave an orphan with different bytes after a crash.
+        self.database.execute("INSERT INTO glaux_messages(owa_id,relative_path,sha256,received_unix,expired_at) VALUES(?1,?2,?3,?4,NULL) ON CONFLICT(owa_id) DO UPDATE SET relative_path=excluded.relative_path,sha256=excluded.sha256,received_unix=excluded.received_unix,expired_at=NULL", params![id,relative,checksum,received_unix])?;
+        Ok(())
+    }
+
+    fn publish_message(&self, category: &str, checksum: &str, bytes: &[u8]) -> Result<String> {
+        let directory = self.root.join("messages").join(category);
         private_directory(&directory)?;
         let relative = format!("messages/{category}/{checksum}.eml");
         let path = self.root.join(&relative);
@@ -343,10 +352,124 @@ impl Archive {
         } else {
             export::publish(&path, bytes)?;
         }
-        // An identical export repairs a publication without a state row. A server-regenerated
-        // MIME representation can leave an orphan with different bytes after a crash.
-        self.database.execute("INSERT INTO glaux_messages(owa_id,relative_path,sha256,received_unix,expired_at) VALUES(?1,?2,?3,?4,NULL) ON CONFLICT(owa_id) DO UPDATE SET relative_path=excluded.relative_path,sha256=excluded.sha256,received_unix=excluded.received_unix,expired_at=NULL", params![id,relative,checksum,received_unix])?;
+        Ok(relative)
+    }
+
+    /// Validate a state path and its parent before reading or deleting a message.
+    fn message_path(&self, relative: &str, checksum: &str) -> Result<PathBuf> {
+        let parts: Vec<_> = relative.split('/').collect();
+        ensure!(
+            parts.len() == 3
+                && parts[0] == "messages"
+                && checksum.len() == 64
+                && checksum
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                && parts[2] == format!("{checksum}.eml"),
+            "Invalid archive state path"
+        );
+        retention::validate(parts[1])?;
+        for directory in [
+            self.root.join("messages"),
+            self.root.join("messages").join(parts[1]),
+        ] {
+            let meta = std::fs::symlink_metadata(directory)?;
+            ensure!(
+                meta.is_dir() && !meta.file_type().is_symlink(),
+                "Invalid archive message directory"
+            );
+        }
+        Ok(self.root.join(relative))
+    }
+
+    fn message_bytes(&self, relative: &str, checksum: &str) -> Result<Vec<u8>> {
+        let path = self.message_path(relative, checksum)?;
+        let meta = std::fs::symlink_metadata(&path)?;
+        ensure!(
+            meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= 10 * 1024 * 1024,
+            "Invalid archived message file"
+        );
+        let bytes = std::fs::read(path)?;
+        ensure!(
+            digest(&bytes) == checksum,
+            "Archived message checksum mismatch"
+        );
+        Ok(bytes)
+    }
+
+    fn cleanup_reprocessed(&self) -> Result<()> {
+        let rows: Vec<(String, String)> = self
+            .database
+            .prepare("SELECT relative_path,sha256 FROM glaux_reprocess_cleanup")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (relative, checksum) in rows {
+            let live: bool = self.database.query_row("SELECT EXISTS(SELECT 1 FROM glaux_messages WHERE relative_path=?1 AND expired_at IS NULL)", [&relative], |r| r.get(0))?;
+            if !live {
+                let path = self.message_path(&relative, &checksum)?;
+                match std::fs::symlink_metadata(&path) {
+                    Ok(_) => {
+                        self.message_bytes(&relative, &checksum)?;
+                        std::fs::remove_file(&path)?;
+                        #[cfg(unix)]
+                        File::open(path.parent().unwrap())?.sync_all()?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            self.database.execute(
+                "DELETE FROM glaux_reprocess_cleanup WHERE relative_path=?1",
+                [&relative],
+            )?;
+        }
         Ok(())
+    }
+
+    /// Reclassify live local files; expired rows, server timestamps and MIME stay unchanged.
+    pub fn reprocess(&self, settings: &Settings, dry_run: bool) -> Result<ReprocessReport> {
+        settings.validate()?;
+        ensure!(
+            settings.archive_dir == self.root,
+            "Reprocess archive does not match owner"
+        );
+        let rows: Vec<(String, String)> = self.database
+            .prepare("SELECT DISTINCT relative_path,sha256 FROM glaux_messages WHERE expired_at IS NULL ORDER BY relative_path")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut report = ReprocessReport {
+            dry_run,
+            ..Default::default()
+        };
+        let mut changes = Vec::new();
+        // Preflight every tracked file before moving anything. Memory holds paths, not MIME.
+        for (relative, checksum) in rows {
+            let bytes = self.message_bytes(&relative, &checksum)?;
+            let category = settings.category(&bytes)?;
+            report.scanned += 1;
+            *report.categories.entry(category.clone()).or_default() += 1;
+            if relative != format!("messages/{category}/{checksum}.eml") {
+                report.moved += 1;
+                changes.push((relative, checksum, category));
+            }
+        }
+        if !dry_run {
+            self.cleanup_reprocessed()?;
+            for (relative, checksum, category) in changes {
+                let bytes = self.message_bytes(&relative, &checksum)?;
+                let destination = self.publish_message(&category, &checksum, &bytes)?;
+                let transaction = self.database.unchecked_transaction()?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO glaux_reprocess_cleanup VALUES(?1,?2)",
+                    params![relative, checksum],
+                )?;
+                transaction.execute("UPDATE glaux_messages SET relative_path=?2 WHERE relative_path=?1 AND expired_at IS NULL", params![relative, destination])?;
+                transaction.commit()?;
+                // A crash leaves a durable cleanup record; the new copy is already published.
+                self.cleanup_reprocessed()?;
+            }
+        }
+        Ok(report)
     }
 
     /// Delete local copies older than their category's retention; returns how many expired.
@@ -451,6 +574,14 @@ impl Archive {
         self.database.execute("INSERT INTO glaux_scan VALUES(?1,?2) ON CONFLICT(folder) DO UPDATE SET next_offset=excluded.next_offset", params![folder,offset])?;
         Ok(())
     }
+}
+
+#[derive(Default, Serialize)]
+pub struct ReprocessReport {
+    pub dry_run: bool,
+    pub scanned: u32,
+    pub moved: u32,
+    pub categories: BTreeMap<String, u32>,
 }
 
 #[derive(Default, Serialize)]
@@ -592,9 +723,12 @@ pub async fn run(config: &Config, settings: &Settings, interval: Option<u64>) ->
     }
     let mut shutdown = Shutdown::new()?;
     let archive = Archive::open(settings)?;
+    archive.cleanup_reprocessed()?;
+    let mut active_settings = settings.clone();
     let mut browser = None;
     let mut failures = 0u32;
     let outcome = async { loop {
+        crate::reprocess::process_pending(&archive, &mut active_settings)?;
         // Signals are already registered. Finish startup before consuming a pending stop,
         // retaining ownership so the launched browser can always be shut down gracefully.
         let launch = if browser.is_none() {
@@ -609,7 +743,7 @@ pub async fn run(config: &Config, settings: &Settings, interval: Option<u64>) ->
                 if authenticate {
                     browser.as_mut().unwrap().authenticate(config).await?;
                 }
-                cycle(&mut OwaMailbox { browser:browser.as_mut().unwrap(),config }, settings, &archive).await
+                cycle(&mut OwaMailbox { browser:browser.as_mut().unwrap(),config }, &active_settings, &archive).await
             } => Some(result),
         }};
         let Some(result) = result else {
@@ -656,13 +790,21 @@ pub async fn run(config: &Config, settings: &Settings, interval: Option<u64>) ->
             .unwrap()
             .saturating_mul(1u64 << failures.min(6))
             .min(86400);
-        tokio::select! {
-            _ = shutdown.wait() => {
-                if let Some(active) = browser.take() { active.shutdown().await; }
-                archive.health(&json!({"state":"stopped"}))?;
-                return Ok(json!({"stopped":true}));
+        let pause = tokio::time::sleep(Duration::from_secs(seconds));
+        tokio::pin!(pause);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait() => {
+                    if let Some(active) = browser.take() { active.shutdown().await; }
+                    archive.health(&json!({"state":"stopped"}))?;
+                    return Ok(json!({"stopped":true}));
+                }
+                _ = &mut pause => break,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    crate::reprocess::process_pending(&archive, &mut active_settings)?;
+                }
             }
-            _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
         }
     }}.await;
     if let Some(active) = browser.take() {
@@ -1138,6 +1280,196 @@ contains = "alert"
             let bytes = format!("From: {from}\r\nSubject: {subject}\r\n\r\nBody\r\n");
             assert_eq!(settings.category(bytes.as_bytes()).unwrap(), category);
         }
+    }
+
+    fn reprocess_settings(root: &Path) -> Settings {
+        Settings {
+            archive_dir: root.join("archive"),
+            rules: vec![Rule {
+                category: "monitoring".into(),
+                header: "subject".into(),
+                contains: "alert".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reprocess_preserves_duplicates_timestamps_and_expired_tombstones() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = reprocess_settings(dir.path());
+        let original = Settings {
+            rules: vec![],
+            ..settings.clone()
+        };
+        let archive = Archive::open(&original).unwrap();
+        archive.store(&original, "first", MIME, Some(100)).unwrap();
+        archive.store(&original, "second", MIME, Some(200)).unwrap();
+        archive.store(&original, "expired", MIME, Some(0)).unwrap();
+        archive
+            .database
+            .execute(
+                "UPDATE glaux_messages SET expired_at=1 WHERE owa_id='expired'",
+                [],
+            )
+            .unwrap();
+        archive.advance("inbox", 42).unwrap();
+        let old = settings
+            .archive_dir
+            .join(format!("messages/other/{}.eml", digest(MIME)));
+        let new = settings
+            .archive_dir
+            .join(format!("messages/monitoring/{}.eml", digest(MIME)));
+        let mut settings = settings;
+        settings
+            .retention
+            .insert("monitoring".into(), Retention { days: 1 });
+        let preview = archive.reprocess(&settings, true).unwrap();
+        assert_eq!((preview.scanned, preview.moved), (1, 1));
+        assert!(old.exists());
+        assert!(!new.exists());
+        let applied = archive.reprocess(&settings, false).unwrap();
+        assert_eq!((applied.scanned, applied.moved), (1, 1));
+        assert!(!old.exists());
+        assert_eq!(std::fs::read(&new).unwrap(), MIME);
+        assert!(archive.contains("first").unwrap());
+        assert!(archive.contains("second").unwrap());
+        assert!(archive.contains("expired").unwrap());
+        assert_eq!(archive.cursor("inbox").unwrap(), 42);
+        let rows: Vec<(i64, Option<i64>)> = archive
+            .database
+            .prepare("SELECT received_unix,expired_at FROM glaux_messages ORDER BY received_unix")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![(0, Some(1)), (100, None), (200, None)]);
+        assert_eq!(archive.reprocess(&settings, false).unwrap().moved, 0);
+        assert_eq!(archive.expire(&settings, 200 + 2 * 86_400).unwrap(), 2);
+    }
+
+    #[test]
+    fn reprocess_recovers_cleanup_after_state_commit_and_coalesces_shared_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = reprocess_settings(dir.path());
+        let original = Settings {
+            rules: vec![],
+            ..settings.clone()
+        };
+        let archive = Archive::open(&original).unwrap();
+        archive.store(&original, "old", MIME, None).unwrap();
+        archive.store(&settings, "new", MIME, None).unwrap();
+        let relative = format!("messages/other/{}.eml", digest(MIME));
+        let target = format!("messages/monitoring/{}.eml", digest(MIME));
+        // Simulate interruption after committing the new path but before deleting the old file.
+        archive
+            .database
+            .execute(
+                "UPDATE glaux_messages SET relative_path=?1 WHERE owa_id='old'",
+                [&target],
+            )
+            .unwrap();
+        archive
+            .database
+            .execute(
+                "INSERT INTO glaux_reprocess_cleanup VALUES(?1,?2)",
+                params![relative, digest(MIME)],
+            )
+            .unwrap();
+        drop(archive);
+        let archive = Archive::open(&settings).unwrap();
+        assert_eq!(archive.reprocess(&settings, false).unwrap().moved, 0);
+        assert!(!settings.archive_dir.join(relative).exists());
+        assert_eq!(
+            std::fs::read(settings.archive_dir.join(target)).unwrap(),
+            MIME
+        );
+        assert!(archive.contains("old").unwrap());
+        assert!(archive.contains("new").unwrap());
+        assert_eq!(
+            archive
+                .database
+                .query_row::<u32, _, _>("SELECT count(*) FROM glaux_reprocess_cleanup", [], |r| r
+                    .get(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn local_reprocess_preserves_sync_skips_even_when_retry_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = reprocess_settings(dir.path());
+        let archive = Archive::open(&settings).unwrap();
+        archive
+            .skip("synthetic-skipped", &owa::ItemExportError::TooLarge)
+            .unwrap();
+        drop(archive);
+        settings.retry_skipped = true;
+        crate::reprocess::local(&settings, true).unwrap();
+        settings.retry_skipped = false;
+        let archive = Archive::open(&settings).unwrap();
+        assert_eq!(archive.skipped_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn reprocess_rejects_missing_corrupt_and_unsafe_files_without_moving_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = reprocess_settings(dir.path());
+        let original = Settings {
+            rules: vec![],
+            ..settings.clone()
+        };
+        let archive = Archive::open(&original).unwrap();
+        archive.store(&original, "first", MIME, None).unwrap();
+        let relative = format!("messages/other/{}.eml", digest(MIME));
+        let path = settings.archive_dir.join(&relative);
+        std::fs::write(&path, b"corrupt").unwrap();
+        assert!(archive.reprocess(&settings, false).is_err());
+        assert!(!settings.archive_dir.join("messages/monitoring").exists());
+        std::fs::remove_file(&path).unwrap();
+        assert!(archive.reprocess(&settings, false).is_err());
+        std::fs::write(&path, MIME).unwrap();
+        archive
+            .database
+            .execute(
+                "UPDATE glaux_messages SET relative_path='../outside.eml'",
+                [],
+            )
+            .unwrap();
+        assert!(archive.reprocess(&settings, false).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), MIME);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reprocess_rejects_symlinked_sources_and_destinations() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = reprocess_settings(dir.path());
+        let original = Settings {
+            rules: vec![],
+            ..settings.clone()
+        };
+        let archive = Archive::open(&original).unwrap();
+        archive.store(&original, "first", MIME, None).unwrap();
+        let path = settings
+            .archive_dir
+            .join(format!("messages/other/{}.eml", digest(MIME)));
+        let outside = dir.path().join("outside.eml");
+        std::fs::write(&outside, MIME).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        symlink(&outside, &path).unwrap();
+        assert!(archive.reprocess(&settings, false).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, MIME).unwrap();
+        let target = settings.archive_dir.join("messages/monitoring");
+        symlink(dir.path(), target).unwrap();
+        assert!(archive.reprocess(&settings, false).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), MIME);
+        assert_eq!(std::fs::read(outside).unwrap(), MIME);
     }
 
     #[test]

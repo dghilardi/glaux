@@ -113,6 +113,27 @@ systemctl --user enable --now glaux.service
 
 The daemon holds the profile lock: stop it before running `glaux login`, other online commands or MCP. Any EML consumer can index `<archive>/messages` without knowing Glaux.
 
+## Reclassifying an existing archive
+
+Edit the sync configuration, then ask the running daemon to preview or apply its rules:
+
+```bash
+glaux reprocess --config /absolute/path/sync.toml --dry-run
+glaux reprocess --config /absolute/path/sync.toml --status
+glaux reprocess --config /absolute/path/sync.toml
+glaux reprocess --config /absolute/path/sync.toml --status
+```
+
+`reprocess` queues a private snapshot of the rules in the archive directory. The upgraded daemon processes it between sync cycles, including during network/authentication backoff, without opening another browser. During an idle wait it checks once per second; an active sync finishes first. A stopped daemon leaves the request queued until the next archive owner (`daemon` or `sync`) starts. Only one request can be pending. `--status` shows the pending request ID and the last `running`, `completed` or `failed` result; queuing is not confirmation of completion. Upgrade an older daemon before submitting requests.
+
+A successful apply replaces the daemon's active classification rules for subsequent downloads. A dry run leaves them unchanged. Keep the updated rules in the daemon's own configuration file so they survive restarts. Requests carry rules only: polling, remote folder and retention settings are not reloaded. Changes to those settings require restarting the daemon.
+
+For an offline archive, stop its owner and run `glaux reprocess --config /absolute/path/sync.toml --local` (optionally with `--dry-run`). This uses only the archive lock, without Chromium or Microsoft credentials. Use the same archive configuration as the daemon; omitting `--config` uses default settings, including an empty rules list.
+
+Reprocessing verifies all tracked live files before moving them and reports only aggregate counts of scanned/moved EML files and destination categories. Identical messages sharing a file count once. It preserves MIME bytes, server receive times, backfill progress and expired-message tombstones. Files absent from SQLite are not imported. New copies are published before SQLite paths change, with durable cleanup records for interrupted moves. Failed operations can be retried; completed moves are retained. Consumers such as Librarian must reconcile changed paths and remove obsolete index entries.
+
+Reprocessing never runs retention or restores expired copies. Later normal sync cycles apply the daemon's active retention to the new categories, so review retention before applying rules. The example leaves retention disabled and does not configure a Librarian index or embeddings.
+
 ## Development
 
 ```bash
