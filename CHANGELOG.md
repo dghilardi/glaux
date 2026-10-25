@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Separate calendar invitations from responses and cancellations, and classify subscriptions using their unsubscribe header.
+
 ### Fixed
 
 - Recognize calendars nested in multipart messages without classifying quoted headers or attached messages.

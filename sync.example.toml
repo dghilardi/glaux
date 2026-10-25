@@ -38,6 +38,24 @@ category = "development-notifications"
 header = "from"
 contains = "jira"
 
+# Invitations may carry agenda/context; keep them separate from RSVP noise.
+# calendar-method reads the parsed text/calendar MIME parameter at any depth.
+[[rules]]
+category = "calendar-invitations"
+header = "calendar-method"
+contains = "REQUEST"
+
+[[rules]]
+category = "calendar-responses"
+header = "calendar-method"
+contains = "REPLY"
+
+[[rules]]
+category = "calendar-responses"
+header = "calendar-method"
+contains = "CANCEL"
+
+# Other calendar methods still have a fallback category.
 [[rules]]
 category = "calendar"
 header = "content-type"
@@ -48,6 +66,12 @@ category = "mailing-list"
 header = "list-id"
 contains = "<"
 
+# An unsubscribe header indicates a subscription, not its usefulness or identity.
+[[rules]]
+category = "subscriptions"
+header = "list-unsubscribe"
+contains = "<"
+
 # To narrow a rule, add an exact mailbox AND a header condition, for example:
 # [[rules]]
 # category = "monitoring"
@@ -55,8 +79,10 @@ contains = "<"
 # header = "subject"
 # contains = "firing"
 
-# Suggested consumers: monitoring/calendar/development-notifications without
-# embeddings; administrative ignored; other reviewed before project indexing.
+# Suggested consumers: monitoring/calendar-responses/development-notifications
+# without embeddings; administrative ignored; calendar-invitations, subscriptions
+# and other reviewed before project indexing. Keep payroll/billing and substantive
+# HR communications separate from administrative reminders; no blanket sender ignore.
 # Nothing is deleted by default. Retention only removes local copies, by server
 # receive time, and remembers expired messages to avoid downloading them again.
 # [retention]

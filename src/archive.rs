@@ -116,11 +116,20 @@ impl Settings {
                     "subject",
                     "list-id",
                     "auto-submitted",
-                    "content-type"
+                    "content-type",
+                    "calendar-method",
+                    "list-unsubscribe"
                 ]
                 .contains(&rule.header.to_ascii_lowercase().as_str()),
                 "Unsupported classification header"
             );
+            if rule.header.eq_ignore_ascii_case("calendar-method") {
+                ensure!(
+                    ["request", "reply", "cancel"]
+                        .contains(&rule.contains.to_ascii_lowercase().as_str()),
+                    "Calendar method must be REQUEST, REPLY or CANCEL"
+                );
+            }
             ensure!(
                 !rule.contains.is_empty() && rule.contains.len() <= 1024,
                 "Rule contains must be 1..1024 bytes"
@@ -151,6 +160,8 @@ impl Settings {
             let needle = rule.contains.to_lowercase();
             let matches = if rule.header.eq_ignore_ascii_case("content-type") {
                 content_type_matches(&mail, &needle)
+            } else if rule.header.eq_ignore_ascii_case("calendar-method") {
+                calendar_method_matches(&mail, &needle)
             } else {
                 mail.headers
                     .get_all_values(&rule.header)
@@ -176,6 +187,19 @@ fn content_type_matches(mail: &mailparse::ParsedMail<'_>, needle: &str) -> bool 
                 .subparts
                 .iter()
                 .any(|part| content_type_matches(part, needle)))
+}
+
+// Calendar methods come from parsed MIME parameters, never a user-supplied header.
+fn calendar_method_matches(mail: &mailparse::ParsedMail<'_>, method: &str) -> bool {
+    (mail.ctype.mimetype.eq_ignore_ascii_case("text/calendar")
+        && mail.ctype.params.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("method") && value.eq_ignore_ascii_case(method)
+        }))
+        || (!mail.ctype.mimetype.starts_with("message/")
+            && mail
+                .subparts
+                .iter()
+                .any(|part| calendar_method_matches(part, method)))
 }
 
 /// Fallback age for rows archived before server times were recorded.
@@ -1357,6 +1381,64 @@ contains = "alert"
             100
         );
         assert!(archive.contains("synthetic-calendar").unwrap());
+    }
+
+    #[test]
+    fn calendar_methods_use_mime_parameters_and_example_precedence() {
+        let mut settings: Settings = toml::from_str(include_str!("../sync.example.toml")).unwrap();
+        settings.archive_dir = "/tmp/synthetic-archive".into();
+        settings.validate().unwrap();
+        for (method, category) in [
+            ("REQUEST", "calendar-invitations"),
+            ("reply", "calendar-responses"),
+            ("CANCEL", "calendar-responses"),
+            ("PUBLISH", "calendar"),
+        ] {
+            let bytes = String::from_utf8_lossy(NESTED_CALENDAR)
+                .replace("method=REQUEST", &format!("METHOD=\"{method}\""));
+            assert_eq!(settings.category(bytes.as_bytes()).unwrap(), category);
+        }
+        let spoofed = b"From: colleague@example.test\r\nCalendar-Method: REQUEST\r\nContent-Type: text/plain; method=REQUEST\r\n\r\nDiscussion\r\n";
+        assert_eq!(settings.category(spoofed).unwrap(), "other");
+        let forwarded = format!(
+            "From: colleague@example.test\r\nContent-Type: message/rfc822\r\n\r\n{}",
+            String::from_utf8_lossy(NESTED_CALENDAR)
+        );
+        assert_eq!(settings.category(forwarded.as_bytes()).unwrap(), "other");
+        let mixed = String::from_utf8_lossy(NESTED_CALENDAR).replace(
+            "--inner--",
+            "--inner\r\nContent-Type: text/calendar; method=REPLY\r\n\r\nReply\r\n--inner--",
+        );
+        assert_eq!(
+            settings.category(mixed.as_bytes()).unwrap(),
+            "calendar-invitations"
+        );
+        settings.rules[0] = Rule {
+            category: "calendar".into(),
+            header: "calendar-method".into(),
+            contains: "re".into(),
+            ..Default::default()
+        };
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn subscription_rules_require_the_header_and_preserve_source_overrides() {
+        let settings: Settings = toml::from_str(include_str!("../sync.example.toml")).unwrap();
+        for (extra, category) in [
+            (
+                "List-Unsubscribe: <https://example.test/unsubscribe>\r\n",
+                "subscriptions",
+            ),
+            ("", "other"),
+        ] {
+            let bytes = format!(
+                "From: robot@example.test\r\nSubject: Synthetic update\r\n{extra}\r\nList-Unsubscribe: <https://example.test/body>\r\n"
+            );
+            assert_eq!(settings.category(bytes.as_bytes()).unwrap(), category);
+        }
+        let bytes = b"From: robot@example.test\r\nSubject: Prometheus firing\r\nList-Unsubscribe: <https://example.test/unsubscribe>\r\n\r\nBody\r\n";
+        assert_eq!(settings.category(bytes).unwrap(), "monitoring");
     }
 
     fn reprocess_settings(root: &Path) -> Settings {
