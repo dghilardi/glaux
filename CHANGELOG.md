@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- Recognize calendars nested in multipart messages without classifying quoted headers or attached messages.
+
 ## [0.2.0] 2026-10-25
 
 ### Added

@@ -148,17 +148,34 @@ impl Settings {
             }) {
                 continue;
             }
-            if mail
-                .headers
-                .get_all_values(&rule.header)
-                .iter()
-                .any(|value| value.to_lowercase().contains(&rule.contains.to_lowercase()))
-            {
+            let needle = rule.contains.to_lowercase();
+            let matches = if rule.header.eq_ignore_ascii_case("content-type") {
+                content_type_matches(&mail, &needle)
+            } else {
+                mail.headers
+                    .get_all_values(&rule.header)
+                    .iter()
+                    .any(|value| value.to_lowercase().contains(&needle))
+            };
+            if matches {
                 return Ok(rule.category.clone());
             }
         }
         Ok("other".into())
     }
+}
+
+// MIME parts belong to the outer message; attached messages keep their own scope.
+fn content_type_matches(mail: &mailparse::ParsedMail<'_>, needle: &str) -> bool {
+    mail.headers
+        .get_all_values("content-type")
+        .iter()
+        .any(|value| value.to_lowercase().contains(needle))
+        || (!mail.ctype.mimetype.starts_with("message/")
+            && mail
+                .subparts
+                .iter()
+                .any(|part| content_type_matches(part, needle)))
 }
 
 /// Fallback age for rows archived before server times were recorded.
@@ -1280,6 +1297,66 @@ contains = "alert"
             let bytes = format!("From: {from}\r\nSubject: {subject}\r\n\r\nBody\r\n");
             assert_eq!(settings.category(bytes.as_bytes()).unwrap(), category);
         }
+    }
+
+    const NESTED_CALENDAR: &[u8] = b"From: organizer@example.test\r\nDate: Sun, 25 Oct 2026 10:00:00 +0000\r\nSubject: Synthetic invitation\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\nContent-Type: text/plain\r\n\r\nAgenda\r\n--inner\r\nContent-Type: text/calendar; charset=UTF-8; method=REQUEST\r\n\r\nBEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n--inner--\r\n--outer--\r\n";
+
+    #[test]
+    fn calendar_rules_match_nested_mime_without_matching_forwarded_headers_or_text() {
+        let settings = Settings {
+            rules: vec![Rule {
+                category: "calendar".into(),
+                header: "CONTENT-TYPE".into(),
+                contains: "TEXT/CALENDAR".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(settings.category(NESTED_CALENDAR).unwrap(), "calendar");
+        let quoted = b"From: colleague@example.test\r\nContent-Type: text/plain\r\n\r\nContent-Type: text/calendar; method=REQUEST\r\n";
+        assert_eq!(settings.category(quoted).unwrap(), "other");
+        let forwarded = format!(
+            "From: colleague@example.test\r\nContent-Type: multipart/mixed; boundary=envelope\r\n\r\n--envelope\r\nContent-Type: text/plain\r\n\r\nDiscussion\r\n--envelope\r\nContent-Type: message/rfc822\r\n\r\n{}\r\n--envelope--\r\n",
+            String::from_utf8_lossy(NESTED_CALENDAR)
+        );
+        assert_eq!(settings.category(forwarded.as_bytes()).unwrap(), "other");
+    }
+
+    #[test]
+    fn reprocessing_nested_calendar_preserves_mime_and_server_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = Settings {
+            archive_dir: dir.path().join("archive"),
+            ..Default::default()
+        };
+        let settings = Settings {
+            rules: vec![Rule {
+                category: "calendar".into(),
+                header: "content-type".into(),
+                contains: "text/calendar".into(),
+                ..Default::default()
+            }],
+            ..original.clone()
+        };
+        let archive = Archive::open(&original).unwrap();
+        archive
+            .store(&original, "synthetic-calendar", NESTED_CALENDAR, Some(100))
+            .unwrap();
+        assert_eq!(archive.reprocess(&settings, true).unwrap().moved, 1);
+        assert_eq!(archive.reprocess(&settings, false).unwrap().moved, 1);
+        let path = settings
+            .archive_dir
+            .join(format!("messages/calendar/{}.eml", digest(NESTED_CALENDAR)));
+        assert_eq!(std::fs::read(path).unwrap(), NESTED_CALENDAR);
+        assert_eq!(
+            archive
+                .database
+                .query_row::<i64, _, _>("SELECT received_unix FROM glaux_messages", [], |r| r
+                    .get(0))
+                .unwrap(),
+            100
+        );
+        assert!(archive.contains("synthetic-calendar").unwrap());
     }
 
     fn reprocess_settings(root: &Path) -> Settings {
