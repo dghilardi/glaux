@@ -3,7 +3,10 @@ use crate::config::trusted_url;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
@@ -11,7 +14,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 pub struct OwaContext {
     pub endpoint: String,
     pub headers: HashMap<String, String>,
-    pub request_header: Option<Value>,
 }
 
 pub struct Cdp {
@@ -20,6 +22,7 @@ pub struct Cdp {
     pub context: Option<OwaContext>,
     requests: HashMap<String, Value>,
     extra_headers: HashMap<String, Value>,
+    successful: HashSet<String>,
 }
 
 impl Cdp {
@@ -33,6 +36,7 @@ impl Cdp {
             context: None,
             requests: HashMap::new(),
             extra_headers: HashMap::new(),
+            successful: HashSet::new(),
         })
     }
     pub async fn command(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -104,25 +108,57 @@ impl Cdp {
                 if self.requests.len() > 512 {
                     self.requests.clear();
                     self.extra_headers.clear();
+                    self.successful.clear();
                 }
-                self.capture(request, &request["headers"]);
+                self.successful.remove(&id);
+                let mut request = json!({"url":request["url"],"headers":request["headers"]});
                 if let Some(headers) = self.extra_headers.remove(&id) {
-                    self.capture(request, &headers);
+                    Self::merge_headers(&mut request, &headers);
                 }
-                self.requests.insert(id, request.clone());
+                self.requests.insert(id.clone(), request);
             }
             Some("Network.requestWillBeSentExtraInfo") => {
-                if let Some(request) = self.requests.get(&id).cloned() {
-                    self.capture(&request, &params["headers"]);
+                if let Some(request) = self.requests.get_mut(&id) {
+                    Self::merge_headers(request, &params["headers"]);
                 } else {
                     if self.extra_headers.len() > 512 {
                         self.extra_headers.clear();
                     }
-                    self.extra_headers.insert(id, params["headers"].clone());
+                    self.extra_headers
+                        .insert(id.clone(), params["headers"].clone());
                 }
+            }
+            Some("Network.responseReceived")
+                if params["response"]["status"]
+                    .as_f64()
+                    .is_some_and(|s| (200.0..300.0).contains(&s)) =>
+            {
+                self.successful.insert(id.clone());
             }
             _ => {}
         }
+        // Outgoing bearer headers can belong to a stale session/bootstrap request.
+        // Publish only after the server accepted that same request; ExtraInfo may be late.
+        if self.successful.contains(&id)
+            && let Some(request) = self.requests.get(&id).cloned()
+        {
+            self.capture(&request, &request["headers"]);
+        }
+    }
+
+    fn merge_headers(request: &mut Value, extra: &Value) {
+        if !request["headers"].is_object() {
+            request["headers"] = json!({});
+        }
+        let mut merged = serde_json::Map::new();
+        for source in [&request["headers"], extra] {
+            if let Some(source) = source.as_object() {
+                for (key, value) in source {
+                    merged.insert(key.to_ascii_lowercase(), value.clone());
+                }
+            }
+        }
+        request["headers"] = Value::Object(merged);
     }
     fn capture(&mut self, request: &Value, headers: &Value) {
         let Some(raw) = request["url"].as_str() else {
@@ -131,9 +167,7 @@ impl Cdp {
         let Ok(mut url) = trusted_url(raw) else {
             return;
         };
-        if !(url.path().starts_with("/owa/") || url.path().starts_with("/ows/"))
-            || !url.path().ends_with("/service.svc")
-        {
+        if url.path() != crate::owa::SERVICE_PATH {
             return;
         }
         let mut captured = HashMap::new();
@@ -159,20 +193,12 @@ impl Cdp {
         }
         url.set_query(None);
         url.set_fragment(None);
-        let request_header = request["postData"]
-            .as_str()
-            .and_then(|s| serde_json::from_str::<Value>(s).ok())
-            .and_then(|v| v.get("Header").cloned());
         if let Some(current) = self.context.as_mut().filter(|c| c.endpoint == url.as_str()) {
             current.headers.extend(captured);
-            if request_header.is_some() {
-                current.request_header = request_header;
-            }
         } else {
             self.context = Some(OwaContext {
                 endpoint: url.to_string(),
                 headers: captured,
-                request_header,
             });
         }
     }
@@ -181,6 +207,39 @@ impl Cdp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn rejects_other_services_and_waits_for_success_and_late_extra_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for event in [
+                json!({"method":"Network.requestWillBeSent","params":{"requestId":"bootstrap","request":{"url":"https://outlook.office.com/ows/bootstrap/service.svc","headers":{"Authorization":"Bearer fixture"}}}}),
+                json!({"method":"Network.responseReceived","params":{"requestId":"bootstrap","response":{"status":200}}}),
+                json!({"method":"Network.requestWillBeSent","params":{"requestId":"rejected","request":{"url":"https://outlook.office.com/owa/service.svc","headers":{"Authorization":"Bearer rejected"}}}}),
+                json!({"method":"Network.responseReceived","params":{"requestId":"rejected","response":{"status":401}}}),
+                json!({"method":"Network.requestWillBeSent","params":{"requestId":"valid","request":{"url":"https://outlook.office.com/owa/service.svc","headers":{}}}}),
+                json!({"method":"Network.responseReceived","params":{"requestId":"valid","response":{"status":200}}}),
+                json!({"method":"Network.requestWillBeSentExtraInfo","params":{"requestId":"valid","headers":{"Authorization":"Bearer accepted"}}}),
+            ] {
+                ws.send(Message::Text(event.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut cdp = Cdp::connect(&format!("ws://{addr}")).await.unwrap();
+        for _ in 0..6 {
+            cdp.receive().await.unwrap();
+            assert!(cdp.context.is_none());
+        }
+        cdp.receive().await.unwrap();
+        assert_eq!(
+            cdp.context.unwrap().headers["authorization"],
+            "Bearer accepted"
+        );
+        server.await.unwrap();
+    }
     // Exercise event reordering with an actual loopback websocket, without corporate credentials.
     #[tokio::test]
     async fn captures_extra_info_only_for_trusted_owa() {
@@ -192,6 +251,7 @@ mod tests {
             for value in [
                 json!({"method":"Network.requestWillBeSentExtraInfo","params":{"requestId":"1","headers":{"Authorization":"Bearer fixture"}}}),
                 json!({"method":"Network.requestWillBeSent","params":{"requestId":"1","request":{"url":"https://outlook.office.com/owa/service.svc?action=FindItem","headers":{}}}}),
+                json!({"method":"Network.responseReceived","params":{"requestId":"1","response":{"status":200}}}),
                 json!({"method":"Network.requestWillBeSent","params":{"requestId":"2","request":{"url":"https://evil.test/owa/service.svc","headers":{"Authorization":"Bearer wrong"}}}}),
             ] {
                 ws.send(Message::Text(value.to_string().into()))
@@ -200,7 +260,7 @@ mod tests {
             }
         });
         let mut cdp = Cdp::connect(&format!("ws://{addr}")).await.unwrap();
-        for _ in 0..3 {
+        for _ in 0..4 {
             cdp.receive().await.unwrap();
         }
         let ctx = cdp.context.unwrap();
@@ -219,6 +279,7 @@ mod tests {
             for value in [
                 json!({"method":"Network.requestWillBeSent","params":{"requestId":"1","request":{"url":"https://outlook.office.com/owa/service.svc?action=FindItem","headers":{"X-OWA-CANARY":"fixture-canary"}}}}),
                 json!({"method":"Network.requestWillBeSentExtraInfo","params":{"requestId":"1","headers":{"Authorization":"Bearer fixture"}}}),
+                json!({"method":"Network.responseReceived","params":{"requestId":"1","response":{"status":200}}}),
             ] {
                 ws.send(Message::Text(value.to_string().into()))
                     .await
@@ -230,6 +291,11 @@ mod tests {
         assert!(
             cdp.context.is_none(),
             "a canary alone must not race ahead of the bearer event"
+        );
+        cdp.receive().await.unwrap();
+        assert!(
+            cdp.context.is_none(),
+            "an outgoing bearer is not evidence of server acceptance"
         );
         cdp.receive().await.unwrap();
         let ctx = cdp.context.unwrap();

@@ -1,0 +1,33 @@
+# Omit archive_dir to use <Glaux data directory>/archive. Absolute paths only.
+# archive_dir = "/absolute/private/mail-archive"
+folder = "inbox"
+page_size = 25
+max_pages = 4
+
+# First matching header rule wins. These are local folders, never server moves.
+# Header values are unverified input, not proof of sender identity.
+[[rules]]
+category = "alerts"
+header = "subject"
+contains = "alert"
+
+[[rules]]
+category = "mailing-list"
+header = "list-id"
+contains = "<"
+
+[[rules]]
+category = "applications"
+header = "from"
+contains = "jira"
+
+[[rules]]
+category = "applications"
+header = "from"
+contains = "bitbucket"
+
+# Add your own explicit sender rules for colleagues. Unmatched mail goes to other.
+# [[rules]]
+# category = "colleagues"
+# header = "from"
+# contains = "@your-company.example"

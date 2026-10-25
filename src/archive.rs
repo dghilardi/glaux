@@ -1,0 +1,701 @@
+//! Local, read-only mailbox replication. Only completed RFC 5322/MIME files are published.
+use crate::{
+    browser::Browser,
+    config::{Config, private_dir},
+    export, owa,
+    shutdown::Shutdown,
+};
+use anyhow::{Context, Result, ensure};
+use fs2::FileExt;
+use mailparse::MailHeaderMap;
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Settings {
+    pub archive_dir: PathBuf,
+    pub folder: String,
+    pub page_size: u32,
+    pub max_pages: u32,
+    pub rules: Vec<Rule>,
+    pub retry_skipped: bool,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rule {
+    pub category: String,
+    pub header: String,
+    pub contains: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            archive_dir: PathBuf::new(),
+            folder: "inbox".into(),
+            page_size: 100,
+            max_pages: 10,
+            rules: Vec::new(),
+            retry_skipped: false,
+        }
+    }
+}
+
+impl Settings {
+    pub fn load(path: Option<&Path>, config: &Config) -> Result<Self> {
+        let mut settings: Self = if let Some(path) = path {
+            toml::from_str(&std::fs::read_to_string(path)?)
+                .map_err(|_| anyhow::anyhow!("Invalid sync configuration"))?
+        } else {
+            Self::default()
+        };
+        if settings.archive_dir.as_os_str().is_empty() {
+            settings.archive_dir = config.data_dir.join("archive");
+        }
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.archive_dir.is_absolute(),
+            "Archive directory must be absolute"
+        );
+        owa::list_request(&self.folder, self.page_size, 0)?;
+        ensure!(
+            (1..=1000).contains(&self.max_pages),
+            "max_pages must be 1..1000"
+        );
+        for rule in &self.rules {
+            ensure!(
+                !rule.category.is_empty()
+                    && rule.category.len() <= 64
+                    && rule.category.bytes().all(|b| b.is_ascii_lowercase()
+                        || b.is_ascii_digit()
+                        || b == b'-'
+                        || b == b'_'),
+                "Invalid local category"
+            );
+            ensure!(
+                ["from", "to", "cc", "subject", "list-id", "auto-submitted"]
+                    .contains(&rule.header.to_ascii_lowercase().as_str()),
+                "Unsupported classification header"
+            );
+            ensure!(
+                !rule.contains.is_empty() && rule.contains.len() <= 1024,
+                "Rule contains must be 1..1024 bytes"
+            );
+        }
+        Ok(())
+    }
+
+    fn category(&self, bytes: &[u8]) -> Result<String> {
+        let mail =
+            mailparse::parse_mail(bytes).map_err(|_| anyhow::anyhow!("Invalid archived MIME"))?;
+        for rule in &self.rules {
+            if mail
+                .headers
+                .get_all_values(&rule.header)
+                .iter()
+                .any(|value| value.to_lowercase().contains(&rule.contains.to_lowercase()))
+            {
+                return Ok(rule.category.clone());
+            }
+        }
+        Ok("other".into())
+    }
+}
+
+fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn private_directory(path: &Path) -> Result<()> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        ensure!(
+            !metadata.file_type().is_symlink() && metadata.is_dir(),
+            "Archive directory must not be a symlink or file"
+        );
+    }
+    private_dir(path)
+}
+
+fn private_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(file) => Ok(file),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = std::fs::symlink_metadata(path)?;
+            ensure!(
+                meta.is_file() && !meta.file_type().is_symlink(),
+                "Archive state must be a regular file"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                ensure!(
+                    meta.permissions().mode() & 0o077 == 0,
+                    "Archive state permissions must be private"
+                );
+            }
+            Ok(OpenOptions::new().read(true).write(true).open(path)?)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub struct Archive {
+    root: PathBuf,
+    database: Connection,
+    _lock: File,
+}
+
+impl Archive {
+    pub fn open(settings: &Settings) -> Result<Self> {
+        settings.validate()?;
+        private_directory(&settings.archive_dir)?;
+        let lock = private_file(&settings.archive_dir.join("archive.lock"))?;
+        lock.try_lock_exclusive()
+            .context("Local archive is already in use")?;
+        private_directory(&settings.archive_dir.join("messages"))?;
+        let path = settings.archive_dir.join("state.sqlite3");
+        private_file(&path)?;
+        let database =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        database.busy_timeout(Duration::from_secs(5))?;
+        let version: u32 = database.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        ensure!(version <= 1, "Unsupported archive schema");
+        if version == 0 {
+            let count: u32 = database.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], |r| r.get(0))?;
+            ensure!(count == 0, "Refusing unrelated archive database");
+            database.execute_batch("BEGIN IMMEDIATE; CREATE TABLE glaux_messages(owa_id TEXT PRIMARY KEY, relative_path TEXT NOT NULL, sha256 TEXT NOT NULL); PRAGMA user_version=1; COMMIT;")?;
+        }
+        let own_schema: u32 = database.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='glaux_messages'",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(own_schema == 1, "Refusing unrelated archive database");
+        database.execute_batch("PRAGMA synchronous=FULL;")?;
+        database.execute_batch("CREATE TABLE IF NOT EXISTS glaux_scan(folder TEXT PRIMARY KEY,next_offset INTEGER NOT NULL);")?;
+        database.execute_batch("CREATE TABLE IF NOT EXISTS glaux_skipped(owa_id TEXT PRIMARY KEY,reason TEXT NOT NULL);")?;
+        if settings.retry_skipped {
+            database.execute("DELETE FROM glaux_skipped", [])?;
+        }
+        Ok(Self {
+            root: settings.archive_dir.clone(),
+            database,
+            _lock: lock,
+        })
+    }
+
+    pub fn contains(&self, id: &str) -> Result<bool> {
+        let row: Option<(String, String)> = self
+            .database
+            .query_row(
+                "SELECT relative_path,sha256 FROM glaux_messages WHERE owa_id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((relative, checksum)) = row else {
+            return Ok(false);
+        };
+        ensure!(
+            Path::new(&relative)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_))),
+            "Invalid archive state path"
+        );
+        let path = self.root.join(relative);
+        if !path.try_exists()? {
+            return Ok(false);
+        }
+        let meta = std::fs::symlink_metadata(&path)?;
+        ensure!(
+            meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= 10 * 1024 * 1024,
+            "Invalid archived message file"
+        );
+        ensure!(
+            digest(&std::fs::read(path)?) == checksum,
+            "Archived message checksum mismatch"
+        );
+        Ok(true)
+    }
+
+    pub fn store(&self, settings: &Settings, id: &str, bytes: &[u8]) -> Result<()> {
+        owa::validate_mime(bytes)?;
+        let category = settings.category(bytes)?;
+        let checksum = digest(bytes);
+        let directory = self.root.join("messages").join(&category);
+        private_directory(&directory)?;
+        let relative = format!("messages/{category}/{checksum}.eml");
+        let path = self.root.join(&relative);
+        if path.try_exists()? {
+            let meta = std::fs::symlink_metadata(&path)?;
+            ensure!(
+                meta.is_file()
+                    && !meta.file_type().is_symlink()
+                    && meta.len() == bytes.len() as u64,
+                "Archive filename conflict"
+            );
+            ensure!(
+                digest(&std::fs::read(&path)?) == checksum,
+                "Archive checksum conflict"
+            );
+        } else {
+            export::publish(&path, bytes)?;
+        }
+        // An identical export repairs a publication without a state row. A server-regenerated
+        // MIME representation can leave an orphan with different bytes after a crash.
+        self.database.execute("INSERT INTO glaux_messages VALUES(?1,?2,?3) ON CONFLICT(owa_id) DO UPDATE SET relative_path=excluded.relative_path,sha256=excluded.sha256", params![id,relative,checksum])?;
+        Ok(())
+    }
+
+    fn health(&self, value: &Value) -> Result<()> {
+        let mut value = value.clone();
+        value["updated_at_unix"] = json!(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs()
+        );
+        let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
+        serde_json::to_writer(&mut temporary, &value)?;
+        temporary.flush()?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(self.root.join("status.json"))?;
+        Ok(())
+    }
+
+    fn skipped(&self, id: &str) -> Result<bool> {
+        Ok(self.database.query_row(
+            "SELECT EXISTS(SELECT 1 FROM glaux_skipped WHERE owa_id=?1)",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
+    fn skip(&self, id: &str, reason: &owa::ItemExportError) -> Result<()> {
+        self.database.execute(
+            "INSERT OR REPLACE INTO glaux_skipped VALUES(?1,?2)",
+            params![id, reason.to_string()],
+        )?;
+        Ok(())
+    }
+    fn skipped_count(&self) -> Result<u32> {
+        Ok(self
+            .database
+            .query_row("SELECT count(*) FROM glaux_skipped", [], |r| r.get(0))?)
+    }
+
+    fn cursor(&self, folder: &str) -> Result<u32> {
+        Ok(self
+            .database
+            .query_row(
+                "SELECT next_offset FROM glaux_scan WHERE folder=?1",
+                [folder],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    fn advance(&self, folder: &str, offset: u32) -> Result<()> {
+        self.database.execute("INSERT INTO glaux_scan VALUES(?1,?2) ON CONFLICT(folder) DO UPDATE SET next_offset=excluded.next_offset", params![folder,offset])?;
+        Ok(())
+    }
+}
+
+#[derive(Default, Serialize)]
+pub struct Report {
+    pub scanned: u32,
+    pub downloaded: u32,
+    pub reused: u32,
+    pub bytes: u64,
+    pub scan_complete: bool,
+    pub resume_offset: u32,
+    pub skipped: u32,
+}
+
+trait Mailbox {
+    async fn list(&mut self, folder: &str, limit: u32, offset: u32) -> Result<owa::MailPage>;
+    async fn mime(&mut self, id: &str) -> Result<Vec<u8>>;
+}
+
+struct OwaMailbox<'a> {
+    browser: &'a mut Browser,
+    config: &'a Config,
+}
+impl Mailbox for OwaMailbox<'_> {
+    async fn list(&mut self, folder: &str, limit: u32, offset: u32) -> Result<owa::MailPage> {
+        owa::list(self.browser, self.config, folder, limit, offset).await
+    }
+    async fn mime(&mut self, id: &str) -> Result<Vec<u8>> {
+        owa::read_mime(self.browser, self.config, id).await
+    }
+}
+
+async fn cycle(
+    mailbox: &mut impl Mailbox,
+    settings: &Settings,
+    archive: &Archive,
+) -> Result<Report> {
+    let mut report = Report::default();
+    let resume = archive.cursor(&settings.folder)?;
+    let mut reconciling_head = true;
+    let mut offset = 0;
+    for _ in 0..settings.max_pages {
+        let page = mailbox
+            .list(&settings.folder, settings.page_size, offset)
+            .await?;
+        let mut unseen = false;
+        for message in page.messages {
+            report.scanned += 1;
+            if archive.contains(&message.id)? {
+                report.reused += 1;
+                continue;
+            }
+            if archive.skipped(&message.id)? {
+                report.skipped += 1;
+                continue;
+            }
+            unseen = true;
+            let bytes = match mailbox.mime(&message.id).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    if let Some(reason) = error.downcast_ref::<owa::ItemExportError>() {
+                        archive.skip(&message.id, reason)?;
+                        report.skipped += 1;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            archive.store(settings, &message.id, &bytes)?;
+            report.downloaded += 1;
+            report.bytes += bytes.len() as u64;
+        }
+        match page.next_offset {
+            Some(next) => {
+                let next =
+                    u32::try_from(next).context("OWA paging offset exceeds supported range")?;
+                ensure!(next > offset, "OWA paging did not advance");
+                // Every cycle reconciles the head, then resumes the historical sweep.
+                offset = if reconciling_head && !unseen {
+                    reconciling_head = false;
+                    next.max(resume)
+                } else {
+                    next
+                };
+            }
+            None => {
+                report.scan_complete = true;
+                offset = 0;
+                archive.advance(&settings.folder, offset)?;
+                break;
+            }
+        }
+        archive.advance(&settings.folder, offset)?;
+    }
+    report.resume_offset = offset;
+    Ok(report)
+}
+
+/// One owner per archive/profile; browser survives successful daemon polling cycles.
+pub async fn run(config: &Config, settings: &Settings, interval: Option<u64>) -> Result<Value> {
+    settings.validate()?;
+    if let Some(seconds) = interval {
+        ensure!(
+            (30..=86400).contains(&seconds),
+            "Interval must be 30..86400 seconds"
+        );
+    }
+    let mut shutdown = Shutdown::new()?;
+    let archive = Archive::open(settings)?;
+    let mut browser = None;
+    let mut failures = 0u32;
+    let outcome = async { loop {
+        // Signals are already registered. Finish startup before consuming a pending stop,
+        // retaining ownership so the launched browser can always be shut down gracefully.
+        let launch = if browser.is_none() {
+            Browser::launch(config, config.headed).await.map(|active| { browser = Some(active); true })
+        } else { Ok(false) };
+        let result = match launch {
+            Err(error) => Some(Err(error)),
+            Ok(authenticate) => tokio::select! {
+            biased;
+            _ = shutdown.wait() => None,
+            result = async {
+                if authenticate {
+                    browser.as_mut().unwrap().authenticate(config).await?;
+                }
+                cycle(&mut OwaMailbox { browser:browser.as_mut().unwrap(),config }, settings, &archive).await
+            } => Some(result),
+        }};
+        let Some(result) = result else {
+            if let Some(active) = browser.take() {
+                active.shutdown().await;
+            }
+            archive.health(&json!({"state":"stopped"}))?;
+            return Ok(json!({"stopped":true}));
+        };
+        match result {
+            Ok(report) => {
+                failures = 0;
+                let skipped_total = archive.skipped_count()?;
+                let value = json!({"state":if skipped_total > 0 {"partial"} else if report.scan_complete {"ready"} else {"backfilling"},"report":report,"skipped_total":skipped_total});
+                archive.health(&value)?;
+                if interval.is_none() {
+                    if let Some(active) = browser.take() {
+                        active.shutdown().await;
+                    }
+                    return Ok(value);
+                }
+                eprintln!("{}", value);
+            }
+            Err(error) => {
+                if let Some(active) = browser.take() {
+                    active.shutdown().await;
+                }
+                let reason = failure_reason(&error);
+                archive.health(&json!({"state":"attention_required","reason":reason,"hint":"Stop daemon and run glaux --headed status or login; also check network and protocol compatibility"}))?;
+                if interval.is_none() {
+                    return Err(error);
+                }
+                failures = failures.saturating_add(1);
+                eprintln!(
+                    "{}",
+                    json!({"event":"sync_failed","state":"attention_required","reason":reason,"consecutive_failures":failures})
+                );
+            }
+        }
+        let seconds = interval
+            .unwrap()
+            .saturating_mul(1u64 << failures.min(6))
+            .min(86400);
+        tokio::select! {
+            _ = shutdown.wait() => {
+                if let Some(active) = browser.take() { active.shutdown().await; }
+                archive.health(&json!({"state":"stopped"}))?;
+                return Ok(json!({"stopped":true}));
+            }
+            _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
+        }
+    }}.await;
+    if let Some(active) = browser.take() {
+        active.shutdown().await;
+    }
+    outcome
+}
+
+fn failure_reason(error: &anyhow::Error) -> &'static str {
+    let description = error.to_string();
+    if description.contains("No authenticated OWA") || description.contains("session expired") {
+        "authentication_or_protocol_required"
+    } else if description.contains("HTTP 429") {
+        "throttled"
+    } else if description.contains("checksum") {
+        "archive_integrity"
+    } else if description.contains("Chromium") {
+        "browser_startup"
+    } else {
+        "transport_or_protocol"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const MIME:&[u8] = b"From: robot@example.test\r\nDate: Sun, 25 Oct 2026 10:00:00 +0000\r\nSubject: Alert synthetic\r\n\r\nBody\r\n";
+    struct FakeMailbox {
+        offsets: Vec<u32>,
+        reads: Vec<String>,
+        fail: bool,
+    }
+    impl Mailbox for FakeMailbox {
+        async fn list(&mut self, _: &str, _: u32, offset: u32) -> Result<owa::MailPage> {
+            self.offsets.push(offset);
+            Ok(owa::MailPage { messages:vec![serde_json::from_value(json!({"id":format!("item-{offset}"),"subject":"synthetic","from":null,"received_at":null,"is_read":false,"has_attachments":false})).unwrap()], total:Some(4), next_offset:if offset<3 {Some((offset+1) as u64)} else {None} })
+        }
+        async fn mime(&mut self, id: &str) -> Result<Vec<u8>> {
+            ensure!(!self.fail, "synthetic failure");
+            self.reads.push(id.into());
+            Ok(MIME.to_vec())
+        }
+    }
+    #[tokio::test]
+    async fn new_mail_burst_is_reconciled_before_old_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            archive_dir: dir.path().join("archive"),
+            page_size: 1,
+            max_pages: 4,
+            ..Default::default()
+        };
+        let archive = Archive::open(&settings).unwrap();
+        archive.store(&settings, "item-2", MIME).unwrap();
+        archive.advance("inbox", 5).unwrap();
+        let mut fake = FakeMailbox {
+            offsets: vec![],
+            reads: vec![],
+            fail: false,
+        };
+        cycle(&mut fake, &settings, &archive).await.unwrap();
+        assert_eq!(fake.offsets, vec![0, 1, 2, 5]);
+    }
+
+    #[tokio::test]
+    async fn oversized_message_does_not_block_other_messages_or_restarts() {
+        struct PoisonMailbox(FakeMailbox);
+        impl Mailbox for PoisonMailbox {
+            async fn list(&mut self, f: &str, l: u32, o: u32) -> Result<owa::MailPage> {
+                self.0.list(f, l, o).await
+            }
+            async fn mime(&mut self, id: &str) -> Result<Vec<u8>> {
+                if id == "item-0" {
+                    return Err(owa::ItemExportError::TooLarge.into());
+                }
+                self.0.mime(id).await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings {
+            archive_dir: dir.path().join("archive"),
+            page_size: 1,
+            max_pages: 4,
+            ..Default::default()
+        };
+        let archive = Archive::open(&settings).unwrap();
+        let mut fake = PoisonMailbox(FakeMailbox {
+            offsets: vec![],
+            reads: vec![],
+            fail: false,
+        });
+        let report = cycle(&mut fake, &settings, &archive).await.unwrap();
+        assert_eq!(report.downloaded, 3);
+        assert_eq!(report.skipped, 1);
+        assert!(report.scan_complete);
+        assert_eq!(archive.skipped_count().unwrap(), 1);
+        drop(archive);
+        let archive = Archive::open(&settings).unwrap();
+        assert!(archive.skipped("item-0").unwrap());
+        drop(archive);
+        settings.retry_skipped = true;
+        assert_eq!(
+            Archive::open(&settings).unwrap().skipped_count().unwrap(),
+            0
+        );
+    }
+    #[tokio::test]
+    async fn sync_resumes_after_restart_and_failed_page_without_skipping_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            archive_dir: dir.path().join("archive"),
+            page_size: 1,
+            max_pages: 2,
+            ..Default::default()
+        };
+        let archive = Archive::open(&settings).unwrap();
+        let mut fake = FakeMailbox {
+            offsets: Vec::new(),
+            reads: Vec::new(),
+            fail: false,
+        };
+        let first = cycle(&mut fake, &settings, &archive).await.unwrap();
+        assert_eq!(fake.offsets, vec![0, 1]);
+        assert_eq!(first.downloaded, 2);
+        assert!(!first.scan_complete);
+        drop(archive);
+        let archive = Archive::open(&settings).unwrap();
+        fake.offsets.clear();
+        fake.fail = true;
+        assert!(cycle(&mut fake, &settings, &archive).await.is_err());
+        assert_eq!(archive.cursor("inbox").unwrap(), 2);
+        fake.fail = false;
+        fake.offsets.clear();
+        let second = cycle(&mut fake, &settings, &archive).await.unwrap();
+        assert_eq!(fake.offsets, vec![0, 2]);
+        assert_eq!(second.reused, 1);
+        assert_eq!(second.downloaded, 1);
+        fake.offsets.clear();
+        assert!(
+            cycle(&mut fake, &settings, &archive)
+                .await
+                .unwrap()
+                .scan_complete
+        );
+        assert_eq!(fake.offsets, vec![0, 3]);
+        assert_eq!(archive.cursor("inbox").unwrap(), 0);
+        assert_eq!(fake.reads.len(), 4);
+    }
+    #[test]
+    fn archive_recovers_publication_and_deduplicates_without_using_message_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            archive_dir: dir.path().join("archive"),
+            rules: vec![Rule {
+                category: "alerts".into(),
+                header: "subject".into(),
+                contains: "alert".into(),
+            }],
+            ..Default::default()
+        };
+        let archive = Archive::open(&settings).unwrap();
+        assert!(Archive::open(&settings).is_err());
+        archive.store(&settings, "owa-1", MIME).unwrap();
+        archive.store(&settings, "owa-2", MIME).unwrap();
+        assert!(archive.contains("owa-1").unwrap());
+        let path = settings
+            .archive_dir
+            .join(format!("messages/alerts/{}.eml", digest(MIME)));
+        assert_eq!(std::fs::read(&path).unwrap(), MIME);
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        archive
+            .database
+            .execute("DELETE FROM glaux_messages", [])
+            .unwrap();
+        archive.store(&settings, "owa-1", MIME).unwrap();
+        assert!(archive.contains("owa-1").unwrap());
+        std::fs::remove_file(&path).unwrap();
+        assert!(!archive.contains("owa-1").unwrap());
+        archive.store(&settings, "owa-1", MIME).unwrap();
+        std::fs::write(&path, b"tampered").unwrap();
+        assert!(archive.contains("owa-1").is_err());
+    }
+    #[test]
+    fn configuration_and_payload_are_validated_before_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings {
+            archive_dir: dir.path().join("archive"),
+            ..Default::default()
+        };
+        settings.rules.push(Rule {
+            category: "../escape".into(),
+            header: "subject".into(),
+            contains: "test".into(),
+        });
+        assert!(settings.validate().is_err());
+        settings.rules.clear();
+        let archive = Archive::open(&settings).unwrap();
+        assert!(archive.store(&settings, "id", b"not mail").is_err());
+        assert!(!archive.contains("id").unwrap());
+    }
+}

@@ -78,12 +78,25 @@ impl GlauxMcp {
 }
 
 pub async fn serve(config: Config) -> Result<()> {
+    let mut shutdown = crate::shutdown::Shutdown::new()?;
+    let gate = Arc::new(Mutex::new(()));
     let server = GlauxMcp {
         config,
-        gate: Arc::new(Mutex::new(())),
+        gate: gate.clone(),
     }
     .serve(stdio())
     .await?;
-    server.waiting().await?;
+    let cancellation = server.cancellation_token();
+    let mut waiting = tokio::spawn(server.waiting());
+    tokio::select! {
+        result = &mut waiting => { result??; }
+        _ = shutdown.wait() => {
+            // Active execute() calls received the same signal: let browser cleanup finish
+            // before rmcp starts its shorter handler-cancellation deadline.
+            let _guard = gate.lock().await;
+            cancellation.cancel();
+            waiting.await??;
+        }
+    }
     Ok(())
 }

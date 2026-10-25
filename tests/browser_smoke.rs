@@ -65,9 +65,28 @@ async fn browser_profile_persists_cookies_and_storage() {
     let mut browser = Browser::launch(&config, false).await.unwrap();
     navigate(&mut browser, &url).await;
     browser.cdp.evaluate("localStorage.setItem('glaux-fixture','persisted'); document.cookie='glaux_fixture=retained; Max-Age=3600; SameSite=Strict; Path=/'; document.cookie='glaux_session=resumed; SameSite=Strict; Path=/'; true").await.unwrap();
+    browser
+        .cdp
+        .command("Target.createTarget", json!({"url":"about:blank"}))
+        .await
+        .unwrap();
     browser.shutdown().await;
 
     let mut browser = Browser::launch(&config, false).await.unwrap();
+    let targets = browser
+        .cdp
+        .command("Target.getTargets", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        targets["targetInfos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["type"] == "page")
+            .count(),
+        1
+    );
     navigate(&mut browser, &url).await;
     let result = browser
         .cdp
@@ -110,4 +129,73 @@ async fn headed_browser_starts_with_desktop_backend() {
     let value = browser.cdp.evaluate("1 + 1").await.unwrap();
     browser.shutdown().await;
     assert_eq!(value, json!(2));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires Chromium; checks signal handling during delayed browser startup"]
+async fn interrupt_during_startup_closes_the_owned_browser() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let wrapper = dir.path().join("delayed-browser");
+    let ready = dir.path().join("ready");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\ntouch \"$GLAUX_LAUNCH_READY\"\nsleep 1\nexec \"$GLAUX_REAL_BROWSER\" \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let data = dir.path().join("data");
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_glaux"))
+        .arg("--data-dir")
+        .arg(&data)
+        .arg("--browser")
+        .arg(&wrapper)
+        .arg("status")
+        .env(
+            "GLAUX_REAL_BROWSER",
+            glaux::config::find_browser(None).unwrap(),
+        )
+        .env("GLAUX_LAUNCH_READY", &ready)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let sent = tokio::process::Command::new("kill")
+        .args(["-INT", &child.id().unwrap().to_string()])
+        .status()
+        .await
+        .unwrap();
+    assert!(sent.success());
+    let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Operation interrupted"));
+    let config = Config::new(Some(data), None, DEFAULT_URL, false, 10).unwrap();
+    assert!(config.lock().is_ok());
+    let port = std::fs::read_to_string(config.profile().join("DevToolsActivePort")).unwrap();
+    let address = format!(
+        "http://127.0.0.1:{}/json/list",
+        port.lines().next().unwrap()
+    );
+    assert!(
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(address)
+            .send()
+            .await
+            .is_err()
+    );
 }

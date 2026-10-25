@@ -1,0 +1,15 @@
+[Unit]
+Description=Glaux local Microsoft 365 email archive
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/glaux daemon --config %h/.config/glaux/sync.toml --interval 300
+WorkingDirectory=%h
+UMask=0077
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=45
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

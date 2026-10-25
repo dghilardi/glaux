@@ -5,6 +5,28 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Only this endpoint has been verified for our FindItem/GetItem envelope.
+pub const SERVICE_PATH: &str = "/owa/service.svc";
+
+#[derive(Debug)]
+pub enum ItemExportError {
+    TooLarge,
+    InvalidMime,
+    MissingMime,
+    NotFound,
+}
+impl std::fmt::Display for ItemExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TooLarge => "message_size_limit",
+            Self::InvalidMime => "invalid_mime",
+            Self::MissingMime => "mime_unavailable",
+            Self::NotFound => "item_not_found",
+        })
+    }
+}
+impl std::error::Error for ItemExportError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailAddress {
     pub name: String,
@@ -116,30 +138,30 @@ fn parse_mime(response: &Value, id: &str) -> Result<Vec<u8>> {
         .pointer("/MimeContent/Value")
         .or_else(|| item.get("MimeContent"))
         .and_then(Value::as_str)
-        .context("OWA did not return MIME content; export compatibility needs checking")?;
+        .ok_or(ItemExportError::MissingMime)?;
     let bytes = STANDARD
         .decode(content)
-        .map_err(|_| anyhow::anyhow!("Invalid OWA MIME encoding"))?;
+        .map_err(|_| ItemExportError::InvalidMime)?;
     validate_mime(&bytes)?;
     Ok(bytes)
 }
 
 pub fn validate_mime(bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 {
-        bail!("MIME export must contain 1 byte to 10 MiB");
+        return Err(ItemExportError::TooLarge.into());
     }
-    let mail = mailparse::parse_mail(bytes).map_err(|_| anyhow::anyhow!("Invalid MIME message"))?;
+    let mail = mailparse::parse_mail(bytes).map_err(|_| ItemExportError::InvalidMime)?;
     use mailparse::MailHeaderMap;
     if mail.headers.get_first_value("From").is_none()
         || mail.headers.get_first_value("Date").is_none()
     {
-        bail!("MIME export lacks required message headers");
+        return Err(ItemExportError::InvalidMime.into());
     }
     Ok(())
 }
 
 /// Never exposes a general-purpose action, arbitrary URL or JavaScript through MCP.
-async fn fetch(browser: &mut Browser, action: &str, mut body: Value) -> Result<Value> {
+async fn fetch(browser: &mut Browser, action: &str, body: Value) -> Result<Value> {
     if !["FindItem", "GetItem"].contains(&action) {
         bail!("Unsupported read-only action");
     }
@@ -149,14 +171,8 @@ async fn fetch(browser: &mut Browser, action: &str, mut body: Value) -> Result<V
         .as_ref()
         .context("No authenticated OWA session")?
         .clone();
-    if let Some(header) = context.request_header {
-        // Keep only version/time-zone metadata, never replay app-specific actions or mailbox identities.
-        for key in ["RequestServerVersion", "TimeZoneContext"] {
-            if let Some(value) = header.get(key) {
-                body["Header"][key] = value.clone();
-            }
-        }
-    }
+    // Use our typed read-only envelope. Unrelated bootstrap requests may carry
+    // differently shaped/null metadata and must not overwrite its version or UTC zone.
     let mut headers = context.headers;
     headers.insert(
         "content-type".into(),
@@ -174,8 +190,18 @@ async fn fetch(browser: &mut Browser, action: &str, mut body: Value) -> Result<V
         try {{
             const response = await fetch(url, {{method:'POST', credentials:'include', redirect:'error',
                 headers:a.headers, body:JSON.stringify(a.body), signal:AbortSignal.timeout(30000)}});
-            const text = await response.text();
-            if (text.length > 16 * 1024 * 1024) return {{status:response.status,error:'size'}};
+            const reader = response.body?.getReader();
+            if (!reader) return {{status:response.status,error:'non-json'}};
+            const chunks = []; let size = 0;
+            while (true) {{
+                const part = await reader.read(); if (part.done) break;
+                size += part.value.byteLength;
+                if (size > 16 * 1024 * 1024) {{ await reader.cancel(); return {{status:response.status,error:'size'}}; }}
+                chunks.push(part.value);
+            }}
+            const data = new Uint8Array(size); let offset = 0;
+            for (const chunk of chunks) {{ data.set(chunk, offset); offset += chunk.byteLength; }}
+            const text = new TextDecoder().decode(data);
             try {{ return {{status:response.status,data:JSON.parse(text)}}; }}
             catch {{ return {{status:response.status,error:'non-json'}}; }}
         }} catch {{ return {{status:0,error:'network'}}; }}
@@ -196,6 +222,14 @@ async fn request(
         browser.authenticate(config).await?;
         response = fetch(browser, action, body).await?;
     }
+    if action == "GetItem" {
+        if response["error"] == "size" || response["status"] == 413 {
+            return Err(ItemExportError::TooLarge.into());
+        }
+        if response["status"] == 404 {
+            return Err(ItemExportError::NotFound.into());
+        }
+    }
     match response["status"].as_u64().unwrap_or_default() {
         200..=299 => {}
         401 | 440 => bail!("OWA session expired; run `glaux login`"),
@@ -204,7 +238,23 @@ async fn request(
         ),
         429 => bail!("OWA throttled the request (HTTP 429). Wait before retrying"),
         0 => bail!("OWA browser request failed (origin mismatch, network failure or timeout)"),
-        status => bail!("OWA returned HTTP {status}"),
+        status => {
+            let code = [
+                "/data/Body/ResponseCode",
+                "/data/Body/ErrorCode",
+                "/data/ResponseCode",
+                "/data/error/code",
+            ]
+            .iter()
+            .find_map(|path| response.pointer(path).and_then(Value::as_str))
+            .filter(|code| {
+                code.starts_with("Error")
+                    && code.len() <= 80
+                    && code.bytes().all(|b| b.is_ascii_alphanumeric())
+            })
+            .unwrap_or("Unclassified");
+            bail!("OWA {action} returned HTTP {status} ({code})");
+        }
     }
     if response.get("error").is_some() {
         bail!(
@@ -261,6 +311,9 @@ fn response_messages(value: &Value) -> Result<&Vec<Value>> {
         {
             // Error codes are identifiers; don't print MessageText, which can contain mail/identities.
             let code = message["ResponseCode"].as_str().unwrap_or("UnknownError");
+            if code == "ErrorItemNotFound" {
+                return Err(ItemExportError::NotFound.into());
+            }
             let code: String = code
                 .chars()
                 .filter(|c| c.is_ascii_alphanumeric())

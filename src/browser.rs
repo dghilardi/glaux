@@ -91,10 +91,25 @@ impl Browser {
             .await?
             .json()
             .await?;
-        let target = targets
-            .iter()
-            .find(|t| t["type"] == "page")
-            .context("Chromium has no page target")?;
+        // Restored login tabs can accumulate and make first-page selection ambiguous.
+        // Own a fresh page, then close only the other pages in this dedicated browser.
+        let target: Value = http
+            .put(format!("http://127.0.0.1:{port}/json/new?about:blank"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        for old in targets.iter().filter(|t| t["type"] == "page") {
+            if let Some(id) = old["id"]
+                .as_str()
+                .filter(|id| id.chars().all(|c| c.is_ascii_hexdigit()))
+            {
+                let _ = http
+                    .get(format!("http://127.0.0.1:{port}/json/close/{id}"))
+                    .send()
+                    .await;
+            }
+        }
         let socket = target["webSocketDebuggerUrl"]
             .as_str()
             .context("Chromium debugger URL missing")?;

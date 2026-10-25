@@ -1,9 +1,11 @@
+pub mod archive;
 pub mod browser;
 pub mod cdp;
 pub mod config;
 pub mod export;
 pub mod mcp;
 pub mod owa;
+pub mod shutdown;
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -44,8 +46,11 @@ pub async fn execute(config: &config::Config, operation: Operation) -> Result<Va
         }
         Operation::Status => {}
     }
+    let mut shutdown = shutdown::Shutdown::new()?;
     let mut browser = browser::Browser::launch(config, config.headed).await?;
     let result = tokio::select! {
+        biased;
+        _ = shutdown.wait() => Err(anyhow::anyhow!("Operation interrupted")),
         result = async {
             browser.authenticate(config).await?;
             match operation {
@@ -63,7 +68,6 @@ pub async fn execute(config: &config::Config, operation: Operation) -> Result<Va
                 },
             }
         } => result,
-        _ = tokio::signal::ctrl_c() => Err(anyhow::anyhow!("Operation interrupted")),
     };
     browser.shutdown().await;
     result

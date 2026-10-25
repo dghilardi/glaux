@@ -82,6 +82,20 @@ enum Commands {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Download unseen messages into a private local EML archive. No remote moves.
+    Sync {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        retry_skipped: bool,
+    },
+    /// Poll OWA and maintain the local archive; one owner of the browser profile.
+    Daemon {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long,default_value_t=300,value_parser=clap::value_parser!(u64).range(30..=86400))]
+        interval: u64,
+    },
     /// Remove the local Glaux browser profile. Does not revoke server-side sessions.
     Logout,
     /// Show local configuration diagnostics without signing in.
@@ -116,6 +130,29 @@ async fn run(cli: Cli, json_output: bool) -> Result<()> {
     )?;
     config.browser_platform = cli.browser_platform;
     match cli.command {
+        Commands::Sync {
+            config: path,
+            retry_skipped,
+        } => {
+            let mut settings = glaux::archive::Settings::load(path.as_deref(), &config)?;
+            settings.retry_skipped |= retry_skipped;
+            output(
+                &glaux::archive::run(&config, &settings, None).await?,
+                json_output,
+            );
+            Ok(())
+        }
+        Commands::Daemon {
+            config: path,
+            interval,
+        } => {
+            let settings = glaux::archive::Settings::load(path.as_deref(), &config)?;
+            output(
+                &glaux::archive::run(&config, &settings, Some(interval)).await?,
+                json_output,
+            );
+            Ok(())
+        }
         Commands::Mcp => glaux::mcp::serve(config).await,
         Commands::Doctor => {
             let browser = find_browser(config.browser.as_ref())?;

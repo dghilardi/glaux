@@ -6,6 +6,25 @@ use tokio::{
 };
 
 #[tokio::test]
+async fn invalid_sync_settings_do_not_open_a_browser() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = directory.path().join("sync.toml");
+    std::fs::write(&settings, "archive_dir = 'relative/path'\n").unwrap();
+    let data = directory.path().join("data");
+    let output = Command::new(env!("CARGO_BIN_EXE_glaux"))
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["--browser", "/bin/false", "sync", "--config"])
+        .arg(settings)
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!data.exists());
+}
+
+#[tokio::test]
 async fn doctor_is_local_and_cli_rejects_untrusted_hosts() {
     let dir = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_glaux"))
@@ -62,6 +81,14 @@ async fn mcp_stdio_discovery_and_errors_without_opening_browser() {
         let response: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(response["result"]["isError"], true);
         assert!(!dir.path().join("browser-profile").exists());
+        #[cfg(unix)] {
+            let call = json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_messages","arguments":{"limit":1}}});
+            stdin.write_all(format!("{call}\n").as_bytes()).await.unwrap();
+            let response: Value=serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(response["result"]["isError"],true);
+            let signal = Command::new("kill").args(["-TERM", &child.id().unwrap().to_string()]).status().await.unwrap();
+            assert!(signal.success());
+        }
         drop(stdin);
         child.wait().await.unwrap();
     }).await.unwrap();
