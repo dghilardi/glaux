@@ -64,13 +64,22 @@ async fn browser_profile_persists_cookies_and_storage() {
     .unwrap();
     let mut browser = Browser::launch(&config, false).await.unwrap();
     navigate(&mut browser, &url).await;
-    browser.cdp.evaluate("localStorage.setItem('glaux-fixture','persisted'); document.cookie='glaux_fixture=retained; Max-Age=3600; SameSite=Strict; Path=/'; document.cookie='glaux_session=resumed; SameSite=Strict; Path=/'; true").await.unwrap();
+    browser.cdp.evaluate("localStorage.setItem('glaux-fixture','persisted'); sessionStorage.setItem('glaux-tab-fixture','resumed'); document.cookie='glaux_fixture=retained; Max-Age=3600; SameSite=Strict; Path=/'; document.cookie='glaux_session=resumed; SameSite=Strict; Path=/'; true").await.unwrap();
     browser
         .cdp
         .command("Target.createTarget", json!({"url":"about:blank"}))
         .await
         .unwrap();
     browser.shutdown().await;
+
+    let preferences: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(config.profile().join("Default/Preferences")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        preferences["profile"]["exit_type"], "Normal",
+        "browser shutdown must flush a clean session"
+    );
 
     let mut browser = Browser::launch(&config, false).await.unwrap();
     let targets = browser
@@ -90,11 +99,12 @@ async fn browser_profile_persists_cookies_and_storage() {
     navigate(&mut browser, &url).await;
     let result = browser
         .cdp
-        .evaluate("({storage:localStorage.getItem('glaux-fixture'),cookies:document.cookie})")
+        .evaluate("({storage:localStorage.getItem('glaux-fixture'),tab:sessionStorage.getItem('glaux-tab-fixture'),cookies:document.cookie})")
         .await
         .unwrap();
     browser.shutdown().await;
     assert_eq!(result["storage"], "persisted");
+    assert_eq!(result["tab"], "resumed");
     assert!(
         result["cookies"]
             .as_str()
@@ -111,6 +121,45 @@ async fn browser_profile_persists_cookies_and_storage() {
     // A third acquisition verifies that shutdown released the application lock.
     assert!(config.lock().is_ok());
     server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium; browser cleanup must not depend on a live page target"]
+async fn detached_page_still_closes_browser_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::new(
+        Some(dir.path().join("detached")),
+        None,
+        DEFAULT_URL,
+        false,
+        10,
+    )
+    .unwrap();
+    let mut browser = Browser::launch(&config, false).await.unwrap();
+    let target = browser
+        .cdp
+        .command("Target.getTargetInfo", json!({}))
+        .await
+        .unwrap();
+    browser
+        .cdp
+        .command("Target.createTarget", json!({"url":"about:blank"}))
+        .await
+        .unwrap();
+    let _ = browser
+        .cdp
+        .command(
+            "Target.closeTarget",
+            json!({"targetId":target["targetInfo"]["targetId"]}),
+        )
+        .await;
+    browser.shutdown().await;
+    let preferences: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(config.profile().join("Default/Preferences")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(preferences["profile"]["exit_type"], "Normal");
+    assert!(config.lock().is_ok());
 }
 
 #[tokio::test]

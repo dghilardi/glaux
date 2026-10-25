@@ -8,13 +8,17 @@ use rmcp::{
     transport::stdio,
 };
 use serde::Deserialize;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct GlauxMcp {
     config: Config,
     gate: Arc<Mutex<()>>,
+    stopping: Arc<AtomicBool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -70,6 +74,9 @@ impl GlauxMcp {
 
 impl GlauxMcp {
     async fn result(&self, operation: Operation) -> CallToolResult {
+        if self.stopping.load(Ordering::Acquire) {
+            return CallToolResult::error(vec![ContentBlock::text("Glaux is shutting down")]);
+        }
         match execute(&self.config, operation).await {
             Ok(data) => CallToolResult::success(vec![ContentBlock::text(serde_json::json!({"ok":true,"data":data}).to_string())]),
             Err(error) => CallToolResult::error(vec![ContentBlock::text(serde_json::json!({"ok":false,"error":format!("{error:#}"),"hint":"Run glaux login in a terminal if authentication is required"}).to_string())]),
@@ -80,9 +87,11 @@ impl GlauxMcp {
 pub async fn serve(config: Config) -> Result<()> {
     let mut shutdown = crate::shutdown::Shutdown::new()?;
     let gate = Arc::new(Mutex::new(()));
+    let stopping = Arc::new(AtomicBool::new(false));
     let server = GlauxMcp {
         config,
         gate: gate.clone(),
+        stopping: stopping.clone(),
     }
     .serve(stdio())
     .await?;
@@ -91,6 +100,7 @@ pub async fn serve(config: Config) -> Result<()> {
     tokio::select! {
         result = &mut waiting => { result??; }
         _ = shutdown.wait() => {
+            stopping.store(true, Ordering::Release);
             // Active execute() calls received the same signal: let browser cleanup finish
             // before rmcp starts its shorter handler-cancellation deadline.
             let _guard = gate.lock().await;
@@ -99,4 +109,41 @@ pub async fn serve(config: Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn queued_tool_does_not_start_browser_after_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = GlauxMcp {
+            config: Config::new(
+                Some(directory.path().join("unused")),
+                None,
+                crate::config::DEFAULT_URL,
+                false,
+                1,
+            )
+            .unwrap(),
+            gate: Arc::new(Mutex::new(())),
+            stopping: Arc::new(AtomicBool::new(false)),
+        };
+        let guard = server.gate.lock().await;
+        let queued = server.clone();
+        let call = tokio::spawn(async move {
+            queued
+                .list_messages(Parameters(ListParams {
+                    folder: None,
+                    limit: None,
+                    offset: None,
+                }))
+                .await
+        });
+        tokio::task::yield_now().await;
+        server.stopping.store(true, Ordering::Release);
+        drop(guard);
+        assert_eq!(call.await.unwrap().is_error, Some(true));
+        assert!(!server.config.data_dir.exists());
+    }
 }

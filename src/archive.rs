@@ -356,6 +356,8 @@ async fn cycle(
     archive: &Archive,
 ) -> Result<Report> {
     let mut report = Report::default();
+    let mut pending_skips = Vec::new();
+    let mut consecutive_errors = 0;
     let resume = archive.cursor(&settings.folder)?;
     let mut reconciling_head = true;
     let mut offset = 0;
@@ -379,7 +381,19 @@ async fn cycle(
                 Ok(bytes) => bytes,
                 Err(error) => {
                     if let Some(reason) = error.downcast_ref::<owa::ItemExportError>() {
-                        archive.skip(&message.id, reason)?;
+                        // A locally measured bound is an item property, even if every
+                        // new message is oversized. Protocol-shaped errors stay gated.
+                        if matches!(reason, owa::ItemExportError::TooLarge) {
+                            archive.skip(&message.id, reason)?;
+                            report.skipped += 1;
+                            continue;
+                        }
+                        consecutive_errors += 1;
+                        ensure!(
+                            consecutive_errors < 5,
+                            "Repeated MIME export failures; check protocol compatibility"
+                        );
+                        pending_skips.push((message.id, *reason));
                         report.skipped += 1;
                         continue;
                     }
@@ -387,6 +401,7 @@ async fn cycle(
                 }
             };
             archive.store(settings, &message.id, &bytes)?;
+            consecutive_errors = 0;
             report.downloaded += 1;
             report.bytes += bytes.len() as u64;
         }
@@ -406,13 +421,24 @@ async fn cycle(
             None => {
                 report.scan_complete = true;
                 offset = 0;
-                archive.advance(&settings.folder, offset)?;
+                if pending_skips.is_empty() || report.downloaded > 0 {
+                    archive.advance(&settings.folder, offset)?;
+                }
                 break;
             }
         }
-        archive.advance(&settings.folder, offset)?;
+        if pending_skips.is_empty() || report.downloaded > 0 {
+            archive.advance(&settings.folder, offset)?;
+        }
     }
     report.resume_offset = offset;
+    ensure!(
+        pending_skips.is_empty() || report.downloaded > 0,
+        "No MIME export succeeded; check protocol compatibility before skipping items"
+    );
+    for (id, reason) in pending_skips {
+        archive.skip(&id, &reason)?;
+    }
     Ok(report)
 }
 
@@ -505,7 +531,10 @@ pub async fn run(config: &Config, settings: &Settings, interval: Option<u64>) ->
 
 fn failure_reason(error: &anyhow::Error) -> &'static str {
     let description = error.to_string();
-    if description.contains("No authenticated OWA") || description.contains("session expired") {
+    if description.contains("No authenticated OWA")
+        || description.contains("session expired")
+        || description.contains("HTTP 403")
+    {
         "authentication_or_protocol_required"
     } else if description.contains("HTTP 429") {
         "throttled"
@@ -557,6 +586,72 @@ mod tests {
         };
         cycle(&mut fake, &settings, &archive).await.unwrap();
         assert_eq!(fake.offsets, vec![0, 1, 2, 5]);
+    }
+
+    #[tokio::test]
+    async fn protocol_wide_mime_failures_are_not_durable_skips() {
+        struct BrokenMailbox(FakeMailbox);
+        impl Mailbox for BrokenMailbox {
+            async fn list(&mut self, f: &str, l: u32, o: u32) -> Result<owa::MailPage> {
+                let mut page = self.0.list(f, l, o).await?;
+                page.next_offset = Some((o + 1).into());
+                Ok(page)
+            }
+            async fn mime(&mut self, _: &str) -> Result<Vec<u8>> {
+                Err(owa::ItemExportError::InvalidMime.into())
+            }
+        }
+        for max_pages in [2, 10] {
+            let dir = tempfile::tempdir().unwrap();
+            let settings = Settings {
+                archive_dir: dir.path().join("archive"),
+                max_pages,
+                ..Default::default()
+            };
+            let archive = Archive::open(&settings).unwrap();
+            let mut fake = BrokenMailbox(FakeMailbox {
+                offsets: vec![],
+                reads: vec![],
+                fail: false,
+            });
+            assert!(cycle(&mut fake, &settings, &archive).await.is_err());
+            assert_eq!(archive.skipped_count().unwrap(), 0);
+            assert_eq!(archive.cursor("inbox").unwrap(), 0);
+            assert!(fake.0.offsets.len() <= 5);
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_new_messages_do_not_stall_a_synced_archive() {
+        struct LargeMailbox(FakeMailbox);
+        impl Mailbox for LargeMailbox {
+            async fn list(&mut self, f: &str, l: u32, o: u32) -> Result<owa::MailPage> {
+                let mut page = self.0.list(f, l, o).await?;
+                page.next_offset = if o < 5 { Some((o + 1).into()) } else { None };
+                Ok(page)
+            }
+            async fn mime(&mut self, _: &str) -> Result<Vec<u8>> {
+                Err(owa::ItemExportError::TooLarge.into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            archive_dir: dir.path().join("archive"),
+            max_pages: 10,
+            ..Default::default()
+        };
+        let archive = Archive::open(&settings).unwrap();
+        let mut fake = LargeMailbox(FakeMailbox {
+            offsets: vec![],
+            reads: vec![],
+            fail: false,
+        });
+        let report = cycle(&mut fake, &settings, &archive).await.unwrap();
+        assert_eq!(report.downloaded, 0);
+        assert_eq!(report.skipped, 6);
+        assert_eq!(archive.skipped_count().unwrap(), 6);
+        assert_eq!(archive.cursor("inbox").unwrap(), 0);
+        assert!(report.scan_complete);
     }
 
     #[tokio::test]

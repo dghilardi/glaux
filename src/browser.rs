@@ -14,6 +14,7 @@ use tokio::{
 pub struct Browser {
     pub cdp: Cdp,
     child: Child,
+    browser_socket: String,
     _lock: File,
 }
 
@@ -91,15 +92,45 @@ impl Browser {
             .await?
             .json()
             .await?;
-        // Restored login tabs can accumulate and make first-page selection ambiguous.
-        // Own a fresh page, then close only the other pages in this dedicated browser.
-        let target: Value = http
-            .put(format!("http://127.0.0.1:{port}/json/new?about:blank"))
+        let version: Value = http
+            .get(format!("http://127.0.0.1:{port}/json/version"))
             .send()
             .await?
             .json()
             .await?;
+        let browser_socket = version["webSocketDebuggerUrl"]
+            .as_str()
+            .context("Chromium browser debugger URL missing")?
+            .to_owned();
+        // Preserve a restored browsing context: sessionStorage belongs to its tab.
+        // Prefer Outlook, then another restored page; create one only if none exists.
+        let restored = targets
+            .iter()
+            .filter(|t| t["type"] == "page")
+            .find(|t| {
+                t["url"]
+                    .as_str()
+                    .is_some_and(|url| crate::config::trusted_url(url).is_ok())
+            })
+            .or_else(|| {
+                targets
+                    .iter()
+                    .find(|t| t["type"] == "page" && t["url"] != "about:blank")
+            })
+            .or_else(|| targets.iter().find(|t| t["type"] == "page"));
+        let target: Value = if let Some(restored) = restored {
+            restored.clone()
+        } else {
+            http.put(format!("http://127.0.0.1:{port}/json/new?about:blank"))
+                .send()
+                .await?
+                .json()
+                .await?
+        };
         for old in targets.iter().filter(|t| t["type"] == "page") {
+            if old["id"] == target["id"] {
+                continue;
+            }
             if let Some(id) = old["id"]
                 .as_str()
                 .filter(|id| id.chars().all(|c| c.is_ascii_hexdigit()))
@@ -113,12 +144,14 @@ impl Browser {
         let socket = target["webSocketDebuggerUrl"]
             .as_str()
             .context("Chromium debugger URL missing")?;
-        let socket_url = url::Url::parse(socket)?;
-        if socket_url.scheme() != "ws"
-            || socket_url.host_str() != Some("127.0.0.1")
-            || socket_url.port() != Some(port)
-        {
-            bail!("Browser returned a non-loopback debugger address");
+        for address in [socket, browser_socket.as_str()] {
+            let socket_url = url::Url::parse(address)?;
+            if socket_url.scheme() != "ws"
+                || socket_url.host_str() != Some("127.0.0.1")
+                || socket_url.port() != Some(port)
+            {
+                bail!("Browser returned a non-loopback debugger address");
+            }
         }
         let mut cdp = Cdp::connect(socket).await?;
         cdp.command("Network.enable", json!({})).await?;
@@ -126,6 +159,7 @@ impl Browser {
         Ok(Self {
             cdp,
             child,
+            browser_socket,
             _lock: lock,
         })
     }
@@ -145,15 +179,20 @@ impl Browser {
 
     pub async fn shutdown(mut self) {
         // Ask Chromium to flush cookies/storage before releasing the profile lock.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(3),
-            self.cdp.command("Browser.close", json!({})),
-        )
+        let _ = tokio::time::timeout(Duration::from_secs(3), async {
+            // The observed page may have navigated, detached or accumulated
+            // background traffic while idle. Close through the browser target.
+            let mut control = Cdp::connect(&self.browser_socket).await?;
+            control.command("Browser.close", json!({})).await
+        })
         .await;
         if tokio::time::timeout(Duration::from_secs(5), self.child.wait())
             .await
             .is_err()
         {
+            eprintln!(
+                "Chromium graceful shutdown timed out; profile persistence requires verification"
+            );
             let _ = self.child.kill().await;
         }
     }

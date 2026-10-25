@@ -114,6 +114,22 @@ class LiveValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((self.path / "cleaned").exists())
 
     @unittest.skipIf(os.name == "nt", "POSIX SIGINT cleanup behavior")
+    async def test_cancel_during_spawn_retains_child_for_cleanup(self):
+        create = asyncio.create_subprocess_exec
+        async def delayed_handle(*args, **kwargs):
+            process = await create(*args, **kwargs)
+            await self.ready()
+            await asyncio.sleep(0.1)
+            return process
+        with patch.object(asyncio, "create_subprocess_exec", delayed_handle):
+            operation = asyncio.create_task(live.cli(self.command("hang"), "list"))
+            await self.ready()
+            operation.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await operation
+        self.assertTrue((self.path / "cleaned").exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX SIGINT cleanup behavior")
     async def test_timeout_allows_cli_cleanup(self):
         with patch.object(live, "CALL_TIMEOUT", 1):
             with self.assertRaises(asyncio.TimeoutError):

@@ -36,8 +36,20 @@ async def stop(process):
         await process.communicate()
 
 
+async def spawn(*args, **kwargs):
+    # Cancellation can arrive after the OS starts the child but before asyncio
+    # returns its handle. Retain that handle and clean up before propagating it.
+    creation = asyncio.create_task(asyncio.create_subprocess_exec(*args, **kwargs))
+    try:
+        return await asyncio.shield(creation)
+    except asyncio.CancelledError:
+        process = await creation
+        await stop(process)
+        raise
+
+
 async def cli(command, *args):
-    process = await asyncio.create_subprocess_exec(
+    process = await spawn(
         *command, *args, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
@@ -63,7 +75,7 @@ async def validate(command):
     require(status.get("mailbox_readable") is True, "Session reuse failed")
     print("CLI: list, plain-text read and session reuse in separate processes passed")
 
-    process = await asyncio.create_subprocess_exec(
+    process = await spawn(
         *command, "mcp", stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         limit=32 * 1024 * 1024,

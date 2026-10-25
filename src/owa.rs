@@ -8,11 +8,10 @@ use serde_json::{Value, json};
 /// Only this endpoint has been verified for our FindItem/GetItem envelope.
 pub const SERVICE_PATH: &str = "/owa/service.svc";
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum ItemExportError {
     TooLarge,
     InvalidMime,
-    MissingMime,
     NotFound,
 }
 impl std::fmt::Display for ItemExportError {
@@ -20,7 +19,6 @@ impl std::fmt::Display for ItemExportError {
         f.write_str(match self {
             Self::TooLarge => "message_size_limit",
             Self::InvalidMime => "invalid_mime",
-            Self::MissingMime => "mime_unavailable",
             Self::NotFound => "item_not_found",
         })
     }
@@ -138,7 +136,7 @@ fn parse_mime(response: &Value, id: &str) -> Result<Vec<u8>> {
         .pointer("/MimeContent/Value")
         .or_else(|| item.get("MimeContent"))
         .and_then(Value::as_str)
-        .ok_or(ItemExportError::MissingMime)?;
+        .context("OWA returned no MimeContent; export compatibility needs checking")?;
     let bytes = STANDARD
         .decode(content)
         .map_err(|_| ItemExportError::InvalidMime)?;
@@ -147,7 +145,11 @@ fn parse_mime(response: &Value, id: &str) -> Result<Vec<u8>> {
 }
 
 pub fn validate_mime(bytes: &[u8]) -> Result<()> {
-    if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 {
+    anyhow::ensure!(
+        !bytes.is_empty(),
+        "OWA returned empty MIME; export compatibility needs checking"
+    );
+    if bytes.len() > 10 * 1024 * 1024 {
         return Err(ItemExportError::TooLarge.into());
     }
     let mail = mailparse::parse_mail(bytes).map_err(|_| ItemExportError::InvalidMime)?;
@@ -222,13 +224,13 @@ async fn request(
         browser.authenticate(config).await?;
         response = fetch(browser, action, body).await?;
     }
-    if action == "GetItem" {
-        if response["error"] == "size" || response["status"] == 413 {
-            return Err(ItemExportError::TooLarge.into());
-        }
-        if response["status"] == 404 {
-            return Err(ItemExportError::NotFound.into());
-        }
+    if action == "GetItem"
+        && (response["error"] == "size"
+            && response["status"]
+                .as_u64()
+                .is_some_and(|s| (200..=299).contains(&s)))
+    {
+        return Err(ItemExportError::TooLarge.into());
     }
     match response["status"].as_u64().unwrap_or_default() {
         200..=299 => {}
@@ -383,6 +385,15 @@ mod tests {
     use super::*;
     #[test]
     fn mime_export_preserves_bytes_and_does_not_change_read_state() {
+        let missing = json!({"Body":{"ResponseMessages":{"Items":[{"ResponseCode":"NoError","Items":[{"ItemId":{"Id":"fixture"}}]}]}}});
+        let error = parse_mime(&missing, "fixture").unwrap_err();
+        assert!(error.downcast_ref::<ItemExportError>().is_none());
+        assert!(
+            validate_mime(b"")
+                .unwrap_err()
+                .downcast_ref::<ItemExportError>()
+                .is_none()
+        );
         let bytes = b"From: sender@example.test\r\nDate: Sun, 25 Oct 2026 10:00:00 +0000\r\nSubject: synthetic\r\n\r\nBody\r\n";
         let response = json!({"Body":{"ResponseMessages":{"Items":[{"ResponseClass":"Success","Items":[{"ItemId":{"Id":"fixture"},"MimeContent":{"Value":STANDARD.encode(bytes)}}]}]}}});
         assert_eq!(parse_mime(&response, "fixture").unwrap(), bytes);
