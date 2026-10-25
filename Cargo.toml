@@ -3,8 +3,12 @@ name = "glaux"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Your Microsoft 365 mailbox, from the terminal. Native Rust, OWA and MCP."
-license = "MIT"
+description = "Read-only Microsoft 365 mail from the terminal and MCP, through Outlook on the web"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dghilardi/glaux"
+readme = "README.md"
+keywords = ["email", "outlook", "microsoft-365", "mcp", "cli"]
+categories = ["command-line-utilities", "email"]
 publish = false
 
 [[bin]]
