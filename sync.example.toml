@@ -4,36 +4,61 @@ folder = "inbox"
 page_size = 25
 max_pages = 4
 
-# First matching header rule wins. These are local folders, never server moves.
-# Header values are unverified input, not proof of sender identity.
+# First matching rule wins. Categories are local folders, never server moves.
+# Classify automatic sources before project keywords. Unmatched mail stays in other
+# for review; a category alone does not authorize indexing or embeddings.
+# Header values and the optional exact sender are not proof of sender identity.
 [[rules]]
-category = "alerts"
+category = "monitoring"
 header = "subject"
-contains = "alert"
+contains = "prometheus"
+
+[[rules]]
+category = "monitoring"
+header = "from"
+contains = "grafana"
+
+[[rules]]
+category = "monitoring"
+header = "subject"
+contains = "grafana"
+
+[[rules]]
+category = "administrative"
+header = "subject"
+contains = "timbratur"
+
+[[rules]]
+category = "development-notifications"
+header = "from"
+contains = "bitbucket"
+
+[[rules]]
+category = "development-notifications"
+header = "from"
+contains = "jira"
+
+[[rules]]
+category = "calendar"
+header = "content-type"
+contains = "text/calendar"
 
 [[rules]]
 category = "mailing-list"
 header = "list-id"
 contains = "<"
 
-[[rules]]
-category = "applications"
-header = "from"
-contains = "jira"
-
-[[rules]]
-category = "applications"
-header = "from"
-contains = "bitbucket"
-
-# Add your own explicit sender rules for colleagues. Unmatched mail goes to other.
+# To narrow a rule, add an exact mailbox AND a header condition, for example:
 # [[rules]]
-# category = "colleagues"
-# header = "from"
-# contains = "@your-company.example"
+# category = "monitoring"
+# sender = "monitor@example.test"
+# header = "subject"
+# contains = "firing"
 
-# Optional: delete local copies of a category after N days, measured from the server
-# receive time. Expired messages are remembered and not downloaded again; the server
-# mailbox is never touched.
+# Suggested consumers: monitoring/calendar/development-notifications without
+# embeddings; administrative ignored; other reviewed before project indexing.
+# Nothing is deleted by default. Retention only removes local copies, by server
+# receive time, and remembers expired messages to avoid downloading them again.
 # [retention]
-# alerts = "10d"
+# monitoring = "14d"
+# development-notifications = "30d"

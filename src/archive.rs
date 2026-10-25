@@ -34,12 +34,15 @@ pub struct Settings {
     pub retention: BTreeMap<String, Retention>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     pub category: String,
     pub header: String,
     pub contains: String,
+    /// Optional exact mailbox, combined with the header condition. Not sender authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
 }
 
 impl Default for Settings {
@@ -85,6 +88,17 @@ impl Settings {
             retention::validate(category)?;
         }
         for rule in &self.rules {
+            if let Some(sender) = &rule.sender {
+                let mailbox = mailparse::addrparse(sender)
+                    .ok()
+                    .and_then(|addresses| addresses.extract_single_info());
+                ensure!(
+                    sender.len() <= 254
+                        && sender.contains('@')
+                        && mailbox.is_some_and(|mailbox| mailbox.addr == *sender),
+                    "Rule sender must be a single mailbox address"
+                );
+            }
             ensure!(
                 !rule.category.is_empty()
                     && rule.category.len() <= 64
@@ -95,8 +109,16 @@ impl Settings {
                 "Invalid local category"
             );
             ensure!(
-                ["from", "to", "cc", "subject", "list-id", "auto-submitted"]
-                    .contains(&rule.header.to_ascii_lowercase().as_str()),
+                [
+                    "from",
+                    "to",
+                    "cc",
+                    "subject",
+                    "list-id",
+                    "auto-submitted",
+                    "content-type"
+                ]
+                .contains(&rule.header.to_ascii_lowercase().as_str()),
                 "Unsupported classification header"
             );
             ensure!(
@@ -110,7 +132,22 @@ impl Settings {
     fn category(&self, bytes: &[u8]) -> Result<String> {
         let mail =
             mailparse::parse_mail(bytes).map_err(|_| anyhow::anyhow!("Invalid archived MIME"))?;
+        let from = mail.headers.get_all_values("from");
+        let sender = if from.len() == 1 {
+            mailparse::addrparse(&from[0])
+                .ok()
+                .and_then(|addresses| addresses.extract_single_info())
+        } else {
+            None
+        };
         for rule in &self.rules {
+            if rule.sender.as_ref().is_some_and(|expected| {
+                !sender
+                    .as_ref()
+                    .is_some_and(|actual| actual.addr.eq_ignore_ascii_case(expected))
+            }) {
+                continue;
+            }
             if mail
                 .headers
                 .get_all_values(&rule.header)
@@ -879,6 +916,7 @@ mod tests {
                 category: "alerts".into(),
                 header: "subject".into(),
                 contains: "alert".into(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -964,6 +1002,7 @@ mod tests {
                 category: "alerts".into(),
                 header: "subject".into(),
                 contains: "alert".into(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1025,6 +1064,83 @@ mod tests {
         }
     }
     #[test]
+    fn exact_sender_and_subject_are_combined_before_generic_rules() {
+        let settings: Settings = toml::from_str(
+            r#"
+archive_dir = "/tmp/synthetic-archive"
+[[rules]]
+category = "monitoring"
+sender = "robot@example.test"
+header = "subject"
+contains = "alert"
+[[rules]]
+category = "review"
+header = "subject"
+contains = "alert"
+"#,
+        )
+        .unwrap();
+        settings.validate().unwrap();
+        assert_eq!(settings.category(MIME).unwrap(), "monitoring");
+        for from in [
+            "robot@example.test <other@example.test>",
+            "robot@example.test.invalid",
+            "robot@example.test, other@example.test",
+        ] {
+            let bytes = format!("From: {from}\r\nSubject: Alert synthetic\r\n\r\nBody\r\n");
+            assert_eq!(settings.category(bytes.as_bytes()).unwrap(), "review");
+        }
+        let bytes = b"From: ROBOT@example.test\r\nSubject: Note\r\n\r\nBody\r\n";
+        assert_eq!(settings.category(bytes).unwrap(), "other");
+        let bytes = b"From: ROBOT@example.test\r\nSubject: ALERT synthetic\r\n\r\nBody\r\n";
+        assert_eq!(settings.category(bytes).unwrap(), "monitoring");
+        let mut invalid = settings;
+        invalid.rules[0].sender = Some("Robot <robot@example.test>".into());
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn example_rules_separate_monitoring_administration_and_development() {
+        let settings: Settings = toml::from_str(include_str!("../sync.example.toml")).unwrap();
+        let settings = Settings {
+            archive_dir: "/tmp/synthetic-archive".into(),
+            ..settings
+        };
+        settings.validate().unwrap();
+        for (from, subject, category) in [
+            (
+                "robot@example.test",
+                "[FIRING] Prometheus architecture warning",
+                "monitoring",
+            ),
+            (
+                "Grafana <robot@example.test>",
+                "Grafana resolved",
+                "monitoring",
+            ),
+            (
+                "robot@example.test",
+                "Promemoria timbrature",
+                "administrative",
+            ),
+            (
+                "Bitbucket <robot@example.test>",
+                "Pull request updated",
+                "development-notifications",
+            ),
+            (
+                "Jira <robot@example.test>",
+                "Issue updated",
+                "development-notifications",
+            ),
+            ("colleague@example.test", "Architecture decision", "other"),
+        ] {
+            let bytes = format!("From: {from}\r\nSubject: {subject}\r\n\r\nBody\r\n");
+            assert_eq!(settings.category(bytes.as_bytes()).unwrap(), category);
+        }
+    }
+
+    #[test]
     fn configuration_and_payload_are_validated_before_publication() {
         let dir = tempfile::tempdir().unwrap();
         let mut settings = Settings {
@@ -1035,6 +1151,7 @@ mod tests {
             category: "../escape".into(),
             header: "subject".into(),
             contains: "test".into(),
+            ..Default::default()
         });
         assert!(settings.validate().is_err());
         settings.rules.clear();
