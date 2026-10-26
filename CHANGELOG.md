@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.3.0] 2026-10-26
+
 ### Added
 
 - Separate calendar invitations from responses and cancellations, and classify subscriptions using their unsubscribe header.
