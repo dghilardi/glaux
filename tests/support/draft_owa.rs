@@ -370,3 +370,106 @@ async fn draft_writes_preserve_templates_reject_conflicts_and_never_retry() {
     .await
     .unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires Chromium; shared socket clients and archive reads use one locked loopback browser"]
+async fn socket_clients_and_archive_work_share_the_owned_browser() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let state = Arc::new(Mutex::new(Fixture::new()));
+        let fixture = state.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let state = fixture.clone();
+                tokio::spawn(async move {
+                    serve(&mut stream, state).await;
+                });
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::new(
+            Some(directory.path().join("data")),
+            None,
+            DEFAULT_URL,
+            false,
+            1,
+        )
+        .unwrap();
+        config.url = url::Url::parse(&url).unwrap(); // Every possible auth renewal stays on loopback.
+        config.mail_write_policy = MailWritePolicy::Drafts;
+        let mut service = glaux::service::Service::bind(&config)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut browser = Browser::launch(&config, false).await.unwrap();
+        navigate(&mut browser, &url).await;
+        browser.cdp.context = Some(OwaContext {
+            endpoint: format!("{url}owa/service.svc"),
+            headers: HashMap::new(),
+        });
+        assert!(config.lock().is_err());
+        let mut client = config.clone();
+        client.browser = Some("/bin/false".into()); // A second browser could not start.
+        let (finished, finish) = tokio::sync::oneshot::channel();
+        let owner_config = config.clone();
+        let owner = tokio::spawn(async move {
+            for _ in 0..3 {
+                service.process_next(&owner_config, &mut browser).await;
+                // Model the archive's MIME fetch between interactive requests.
+                assert_eq!(
+                    owa::read_mime(&mut browser, &owner_config, "signature-template")
+                        .await
+                        .unwrap(),
+                    TEMPLATE_MIME
+                );
+                assert!(owner_config.lock().is_err());
+            }
+            let _ = finish.await;
+            browser.shutdown().await;
+        });
+        let output = directory.path().join("client-export.eml");
+        let email = EmailInput {
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Synthetic socket draft".into(),
+            html: "<p>Shared session</p>".into(),
+        };
+        let (read, draft, export) = tokio::join!(
+            glaux::execute(
+                &client,
+                glaux::Operation::Read {
+                    id: "signature-template".into()
+                }
+            ),
+            glaux::execute(
+                &client,
+                glaux::Operation::CreateDraft {
+                    email,
+                    signature_draft_id: "signature-template".into()
+                }
+            ),
+            glaux::execute(
+                &client,
+                glaux::Operation::Export {
+                    id: "signature-template".into(),
+                    output: output.clone()
+                }
+            ),
+        );
+        assert_eq!(read.unwrap()["is_draft"], true);
+        assert_eq!(draft.unwrap()["verified"], true);
+        assert_eq!(export.unwrap()["exported"], true);
+        assert_eq!(std::fs::read(output).unwrap(), TEMPLATE_MIME);
+        assert_eq!(state.lock().await.writes, 1);
+        finished.send(()).unwrap();
+        owner.await.unwrap();
+        assert!(config.lock().is_ok());
+        server.abort();
+    })
+    .await
+    .unwrap();
+}

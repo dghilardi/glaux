@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub const MAX_HTML_BYTES: usize = 256 * 1024;
 pub const MAX_RECIPIENTS: usize = 100;
 
-#[derive(Clone, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EmailInput {
     /// Bare email addresses, without display names. At most 100 recipients in total.

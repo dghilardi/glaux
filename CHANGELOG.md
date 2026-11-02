@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Shared local mailbox service on Unix: CLI and MCP reuse the daemon's browser through a private socket while archiving continues, with bounded queues, daemon-enforced draft permissions and no automatic retries after uncertain writes.
+
 ## [0.4.0] 2026-11-02
 
 ### Added

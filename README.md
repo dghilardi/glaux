@@ -13,6 +13,8 @@ Early prototype (0.1.0), tested on Linux with Chromium against one commercial Mi
 
 Mailbox access is **read-only by default** (`FindItem` and `GetItem`). Experimental, explicitly enabled [draft composition](docs/composing.md) adds `CreateItem`/`UpdateItem` with `SaveOnly`; recipient-free creation and updates passed on one live session, with [remaining validation limits](docs/live-validation.md#recorded-validation-2026-11-02). Glaux never sends, deletes, moves or marks messages as read.
 
+On Unix, CLI and MCP automatically share the running daemon's browser through a private local socket, so archiving can continue while clients use the mailbox. Without a daemon they use a standalone browser. Drafts require opt-in permission in both the client and daemon. Shared-service live validation is still pending; see [architecture](docs/architecture.md#shared-mailbox-service).
+
 ## How it works
 
 1. `glaux login` opens Chromium with a dedicated profile outside your personal browser. You sign in to Microsoft yourself, including MFA.
@@ -63,7 +65,7 @@ glaux mcp                             # MCP server over stdio
 
 ## Configuration
 
-Global flags (each also has an environment variable):
+Global flags and environment variables:
 
 | Flag | Variable | Purpose |
 |---|---|---|
@@ -73,7 +75,8 @@ Global flags (each also has an environment variable):
 | `--url URL` | `GLAUX_OWA_URL` | Start page, default `https://outlook.office.com/mail/` |
 | `--passkey-account EMAIL` | `GLAUX_PASSKEY_ACCOUNT` | Optional unattended passkey sign-in, see [passkey](docs/passkey.md) |
 | `--mail-write-policy read-only\|drafts` | `GLAUX_MAIL_WRITE_POLICY` | Read-only by default; opt in to unsent drafts, never sending |
-| `--headed` | | Show the browser for every command |
+| `--headed` | | Show a standalone/daemon browser; cannot change an already running daemon |
+| `--standalone` | | Bypass daemon routing; requires an idle profile |
 | `--timeout SECONDS` | | Authentication wait, 1–900 |
 | `--json` | | Force JSON output |
 

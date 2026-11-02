@@ -1,6 +1,6 @@
 # Architecture
 
-A single Rust package provides the `glaux` library and binary. The CLI and the MCP server call the same `execute` function, so they validate input and manage the session in the same way.
+A single Rust package provides the `glaux` library and binary. The CLI and the MCP server call the same `execute` function. It validates locally, returns offline previews immediately, and routes online operations to the local daemon when its socket exists. Without a daemon it retains standalone browser execution. `--standalone` explicitly bypasses routing but cannot take a profile owned by the daemon; `login` is always standalone.
 
 ## Modules
 
@@ -17,11 +17,12 @@ A single Rust package provides the `glaux` library and binary. The CLI and the M
 - `reprocess.rs`: private durable rule snapshots and aggregate results for reclassification by the archive owner; no browser or additional archive owner.
 - `login.rs`: optional passkey sign-in; bounded actions on Microsoft sign-in hosts only, no secrets handled by Glaux.
 - `guard.rs`: starts and stops a systemd authenticator unit based on the `loginctl` session state.
-- `lib.rs`: input validation, authentication, the operation itself and cleanup on errors or Ctrl-C.
+- `lib.rs`: shared validation and browser operations, local/daemon routing and standalone cleanup on errors or Ctrl-C.
+- `service.rs`: bounded Unix socket transport, same-user peer checks, private endpoint ownership and the daemon's interactive queue. No browser handles or credentials cross this boundary.
 - `main.rs`: CLI, human/JSON output and diagnostics.
 - `mcp.rs`: three read-only stdio tools plus two draft tools exposed only under the process draft-write policy; calls are serialized.
 
-## Lifecycle of a read
+## Lifecycle of a standalone read
 
 1. Validate input and acquire the profile lock.
 2. Start Chromium with the dedicated profile and an ephemeral loopback-only CDP port. The browser sandbox stays enabled.
@@ -40,10 +41,22 @@ The renewal retry applies to reads only. Draft writes are never retried. With `-
 
 ## Deliberate limits
 
-Authentication depends on an external Chromium. Every command reloads the web app, which is slower than an HTTP client with its own refresh token, but keeps SSO and credential handling inside the browser and avoids depending on Microsoft's internal token flows.
+Authentication depends on an external Chromium. Standalone commands reload the web app; daemon clients reuse its authenticated browser. SSO and credential handling stay inside Chromium, without depending on Microsoft's internal token flows.
 
 Glaux does not use EWS SOAP, Microsoft Graph, the deprecated Outlook REST API or client IDs of other applications. The OWA payload version and UTC time zone are fixed by Glaux and not copied from the web app's own requests.
 
 The EML archive is an explicit `sync`/`daemon` feature, separate from the browser profile. The daemon keeps its browser open while polling. It consumes local reprocessing requests between cycles and during backoff. Reclassification publishes verified copies before updating SQLite, records cleanup durably and preserves receive times and expired tombstones; it does not run retention. Successful requests also replace the active classification rules. There are no extra heartbeats to stretch the session and no application telemetry; Chromium and Outlook keep their own network behaviour.
+
+## Shared mailbox service
+
+On Unix the daemon binds `service.sock` in the dedicated data directory. The directory must be owned by the current user with mode 0700; the socket is 0600, symlinks are refused, and both peers verify the effective user ID. A separate lifetime lock prevents competing daemons, standalone commands, one-off sync and logout, including during browser failure backoff. Only an owned, private, refused stale socket can be replaced. Shutdown removes only the endpoint it created. Custom data directories must fit the platform's Unix socket path-length limit.
+
+Each connection carries one versioned, length-prefixed JSON request and response. Requests contain a fixed operation and the configured Outlook URL, never arbitrary OWA actions, code, browser settings or write-policy overrides. Requests are capped at 2 MiB and responses at 16 MiB. At most 16 connections and 8 queued operations are retained. Handshake/response transmission is bounded to 10 seconds; clients and queued work have a 180-second deadline. Malformed data is rejected without echoing it or logging message data. Export transfers bounded MIME to the client, which validates and publishes its local output; the daemon does not accept output paths.
+
+The archive loop remains the sole browser owner. It processes at most one live interactive request before each archive listing or MIME fetch, and serves requests during polling waits/backoff. An interactive operation, including a complete draft save/readback, is serialized against all other browser work. Both archive progress and interactive traffic get turns; a single OWA request or authentication can still delay a client. Policy and input checks run again in the daemon before execution. Drafts require permission in both the client process and daemon configuration.
+
+Disconnected or expired requests are skipped if observed before execution. After execution starts, a client disconnect does not cancel a potentially applied write. Connection loss, timeout or interruption after submission never triggers a retry or standalone fallback; a write is reported as unconfirmed when its outcome is unknown. A stale or inaccessible existing endpoint is an error, not permission to launch a second browser. A missing endpoint falls back only when no daemon ownership lock is held. Client shutdown closes its own connection; daemon shutdown cleans up its owned browser and fails outstanding requests.
+
+The Unix transport is verified with synthetic Linux fixtures. Other Unix platforms and live mailbox coexistence require separate validation; non-Unix platforms retain standalone operation.
 
 Shutdown uses a separate CDP connection to the browser target, validated against the same loopback port, so it works even if the observed page has detached. A forced kill after a timeout prints a generic persistence warning.

@@ -1,0 +1,4 @@
+# Opt-in policy for both standalone daemon writes and its local socket clients.
+# Install as ~/.config/systemd/user/glaux.service.d/drafts.conf, then restart Glaux.
+[Service]
+Environment=GLAUX_MAIL_WRITE_POLICY=drafts

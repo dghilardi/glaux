@@ -645,12 +645,19 @@ trait Mailbox {
 struct OwaMailbox<'a> {
     browser: &'a mut Browser,
     config: &'a Config,
+    service: Option<&'a mut crate::service::Service>,
 }
 impl Mailbox for OwaMailbox<'_> {
     async fn list(&mut self, folder: &str, limit: u32, offset: u32) -> Result<owa::MailPage> {
+        if let Some(service) = &mut self.service {
+            service.process_one(self.config, self.browser).await;
+        }
         owa::list(self.browser, self.config, folder, limit, offset).await
     }
     async fn mime(&mut self, id: &str) -> Result<Vec<u8>> {
+        if let Some(service) = &mut self.service {
+            service.process_one(self.config, self.browser).await;
+        }
         owa::read_mime(self.browser, self.config, id).await
     }
 }
@@ -761,8 +768,15 @@ pub async fn run(config: &Config, settings: &Settings, interval: Option<u64>) ->
             (30..=86400).contains(&seconds),
             "Interval must be 30..86400 seconds"
         );
+    } else {
+        crate::service::require_idle_profile(config)?;
     }
     let mut shutdown = Shutdown::new()?;
+    let mut service = if interval.is_some() {
+        crate::service::Service::bind(config).await?
+    } else {
+        None
+    };
     let archive = Archive::open(settings)?;
     archive.cleanup_reprocessed()?;
     let mut active_settings = settings.clone();
@@ -784,7 +798,7 @@ pub async fn run(config: &Config, settings: &Settings, interval: Option<u64>) ->
                 if authenticate {
                     browser.as_mut().unwrap().authenticate(config).await?;
                 }
-                cycle(&mut OwaMailbox { browser:browser.as_mut().unwrap(),config }, &active_settings, &archive).await
+                cycle(&mut OwaMailbox { browser:browser.as_mut().unwrap(),config, service:service.as_mut() }, &active_settings, &archive).await
             } => Some(result),
         }};
         let Some(result) = result else {
@@ -833,6 +847,8 @@ pub async fn run(config: &Config, settings: &Settings, interval: Option<u64>) ->
             .min(86400);
         let pause = tokio::time::sleep(Duration::from_secs(seconds));
         tokio::pin!(pause);
+        let mut control_tick = tokio::time::interval(Duration::from_secs(1));
+        control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
@@ -842,8 +858,24 @@ pub async fn run(config: &Config, settings: &Settings, interval: Option<u64>) ->
                     return Ok(json!({"stopped":true}));
                 }
                 _ = &mut pause => break,
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                _ = control_tick.tick() => {
                     crate::reprocess::process_pending(&archive, &mut active_settings)?;
+                }
+                job = async {
+                    match &mut service {
+                        Some(service) => service.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(job) = job {
+                        if crate::service::run_idle(config, &mut browser, job, &mut shutdown).await {
+                            if let Some(active) = browser.take() { active.shutdown().await; }
+                            archive.health(&json!({"state":"stopped"}))?;
+                            return Ok(json!({"stopped":true}));
+                        }
+                    } else {
+                        anyhow::bail!("Local mailbox service listener stopped");
+                    }
                 }
             }
         }

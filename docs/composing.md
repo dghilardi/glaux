@@ -17,7 +17,16 @@ The default `read-only` policy exposes `list_messages`, `read_message` and the l
 }
 ```
 
-Alternatively set `GLAUX_MAIL_WRITE_POLICY=drafts` for that process. The policy is enforced in the shared core and OWA transport; it cannot be changed by tool arguments. There is no `send` policy. CLI and MCP use the same operations and exclusive browser-profile lock. An existing daemon must release the profile before online draft commands can run.
+Alternatively set `GLAUX_MAIL_WRITE_POLICY=drafts` for that process. The policy is enforced in the shared core and OWA transport; it cannot be changed by tool arguments. There is no `send` policy. On Unix, CLI and MCP automatically use the running daemon's private socket and shared browser, so archiving can continue. Use the same `--data-dir` and Outlook URL as the daemon. Draft writes must also be enabled in the daemon; enabling them only in an MCP client does not grant the service permission to write.
+
+For a systemd user service, add a drop-in with `systemctl --user edit glaux.service`:
+
+```ini
+[Service]
+Environment=GLAUX_MAIL_WRITE_POLICY=drafts
+```
+
+Restart the service after changing its policy. Subsequent MCP and CLI calls reuse it without stopping archiving. Without a daemon, commands retain standalone browser execution. `--standalone` and `login` require an idle profile; do not bypass its lock. Preview remains local and works even when the service is unavailable or busy.
 
 ## Prepare a signature template in Outlook
 

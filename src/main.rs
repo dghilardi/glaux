@@ -19,6 +19,12 @@ struct Cli {
     #[arg(
         long,
         global = true,
+        help = "Use a standalone browser instead of the local daemon; the profile must be idle"
+    )]
+    standalone: bool,
+    #[arg(
+        long,
+        global = true,
         env = "GLAUX_MAIL_WRITE_POLICY",
         value_enum,
         default_value = "read-only",
@@ -194,6 +200,7 @@ async fn run(cli: Cli, json_output: bool) -> Result<()> {
     )?;
     config.browser_platform = cli.browser_platform;
     config.mail_write_policy = cli.mail_write_policy;
+    config.standalone = cli.standalone || login;
     config.passkey_account = cli
         .passkey_account
         .as_deref()
@@ -257,6 +264,7 @@ async fn run(cli: Cli, json_output: bool) -> Result<()> {
             Ok(())
         }
         Commands::Logout => {
+            glaux::service::require_idle_profile(&config)?;
             let _lock = config.lock()?;
             std::fs::remove_dir_all(config.profile())?;
             output(

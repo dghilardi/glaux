@@ -10,7 +10,7 @@ use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, ContentBlock},
     schemars, tool, tool_router,
-    transport::stdio,
+    transport::stdio_pipes,
 };
 use serde::Deserialize;
 use std::sync::{
@@ -186,7 +186,7 @@ pub async fn serve(config: Config) -> Result<()> {
         gate: gate.clone(),
         stopping: stopping.clone(),
     }
-    .serve(stdio())
+    .serve(stdio_pipes())
     .await?;
     let cancellation = server.cancellation_token();
     let mut waiting = tokio::spawn(server.waiting());

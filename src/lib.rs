@@ -11,11 +11,14 @@ pub mod mcp;
 pub mod owa;
 pub mod reprocess;
 pub mod retention;
+pub mod service;
 pub mod shutdown;
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     PreviewEmail {
         email: compose::EmailInput,
@@ -38,9 +41,14 @@ pub enum Operation {
     Read {
         id: String,
     },
+    #[serde(skip)]
     Export {
         id: String,
         output: std::path::PathBuf,
+    },
+    #[doc(hidden)]
+    ReadMime {
+        id: String,
     },
     Status,
 }
@@ -87,7 +95,7 @@ pub(crate) fn validate_operation(
         } => {
             owa::list_request(folder, *limit, *offset)?;
         }
-        Operation::Read { id } => {
+        Operation::Read { id } | Operation::ReadMime { id } => {
             owa::read_request(id)?;
         }
         Operation::Export { id, output } => {
@@ -140,6 +148,12 @@ pub(crate) async fn execute_in_browser(
         Operation::Read { id } => Ok(serde_json::to_value(
             owa::read(browser, config, &id).await?,
         )?),
+        Operation::ReadMime { id } => {
+            use base64::Engine;
+            Ok(
+                json!({"mime":base64::engine::general_purpose::STANDARD.encode(owa::read_mime(browser, config, &id).await?)}),
+            )
+        }
         Operation::Export { id, output } => {
             let bytes = owa::read_mime(browser, config, &id).await?;
             export::publish(&output, &bytes)?;
@@ -153,11 +167,41 @@ pub(crate) async fn execute_in_browser(
     }
 }
 
-/// Every standalone operation closes Chromium on success, errors and signals.
+/// Prefer the daemon for online operations; never retry a submitted service call.
 pub async fn execute(config: &config::Config, operation: Operation) -> Result<Value> {
     if let Some(local) = validate_operation(config, &operation)? {
         return Ok(local);
     }
+    if !config.standalone {
+        if let Operation::Export { id, output } = &operation {
+            if let Some(result) =
+                service::forward(config, &Operation::ReadMime { id: id.clone() }).await?
+            {
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(
+                        result["mime"]
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("invalid_service_mime"))?,
+                    )
+                    .map_err(|_| anyhow::anyhow!("invalid_service_mime"))?;
+                owa::validate_mime(&bytes)?;
+                export::publish(output, &bytes)?;
+                return Ok(json!({"exported":true,"bytes":bytes.len(),"format":"eml"}));
+            }
+        } else if let Some(result) = service::forward(config, &operation).await? {
+            return Ok(result);
+        }
+    }
+    execute_standalone(config, operation).await
+}
+
+/// Every standalone operation closes Chromium on success, errors and signals.
+pub async fn execute_standalone(config: &config::Config, operation: Operation) -> Result<Value> {
+    if let Some(local) = validate_operation(config, &operation)? {
+        return Ok(local);
+    }
+    service::require_idle_profile(config)?;
     let mut shutdown = shutdown::Shutdown::new()?;
     let mut browser = browser::Browser::launch(config, config.headed).await?;
     let result = tokio::select! {

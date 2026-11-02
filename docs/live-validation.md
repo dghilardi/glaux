@@ -25,7 +25,7 @@ Expected: sign-in in the dedicated window; success reported only after a valid i
 
 The presence of the profile directory is not proof of authentication. `doctor` is local; `status` performs an online read. A success on the same day proves reuse across processes, not a 24-hour Microsoft session.
 
-If the daemon is running, stop it first to release the profile lock:
+For standalone persistence checks, stop the daemon first to release the profile lock. Normal Unix CLI/MCP calls instead share the running daemon's browser; these demonstrate service reuse, not independent browser/session restoration:
 
 ```bash
 systemctl --user stop glaux.service
@@ -35,6 +35,10 @@ systemctl --user start glaux.service
 ```
 
 Restart the service even if the check fails, then inspect the `reason` in `archive/status.json`.
+
+## Shared daemon validation
+
+Live coexistence is **pending**. Loopback Chromium tests verify shared browser ownership but do not establish live tenant behavior. After upgrading the daemon and clients, keep the daemon running and run `scripts/validate_live.py` normally. Confirm CLI and MCP list/read results match and archive progress continues, with no extra browser and no profile-lock errors. Use matching data directories and Outlook URLs. With explicit draft permission on both sides, create/update one synthetic recipient-free draft and check it in Outlook while archiving remains active. Test default service refusal of writes separately. Keep all IDs and content private; record only aggregate outcomes. Do not inject network failures into a real mailbox.
 
 ## Expected errors
 

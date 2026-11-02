@@ -67,6 +67,8 @@ pub struct Config {
     /// Enables unattended passkey sign-in for this account; see `login.rs`.
     pub passkey_account: Option<String>,
     pub mail_write_policy: MailWritePolicy,
+    /// Bypass daemon routing for explicit login/diagnostics; never bypasses the profile lock.
+    pub standalone: bool,
 }
 
 impl Config {
@@ -91,6 +93,7 @@ impl Config {
             browser_platform: BrowserPlatform::Auto,
             passkey_account: None,
             mail_write_policy: MailWritePolicy::ReadOnly,
+            standalone: false,
         })
     }
     pub fn profile(&self) -> PathBuf {
