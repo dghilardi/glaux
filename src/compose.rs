@@ -22,22 +22,60 @@ pub struct EmailInput {
     /// Semantic HTML fragment (p, headings, lists, links, tables, emphasis). No CSS or images.
     /// Plain text is derived automatically. Maximum 256 KiB.
     pub html: String,
-    /// Controlled presentation options; omitted values use the neutral default theme.
+    /// Controlled presentation options; omitted values inherit local configuration, then neutral defaults.
     #[serde(default)]
     pub theme: EmailTheme,
 }
 
-#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmailTheme {
-    /// Link and heading color, in #RRGGBB format. Must contrast with white by at least 4.5:1.
-    pub accent: String,
+    /// Heading color (#RRGGBB), also the fallback for links. Contrast on white >= 4.5:1.
+    pub accent: Option<String>,
+    /// Body text color (#RRGGBB). Contrast on white >= 4.5:1.
+    pub text: Option<String>,
+    /// Link color (#RRGGBB). Contrast on white >= 4.5:1.
+    pub link: Option<String>,
+    /// Table borders and horizontal rules (#RRGGBB); never conveys meaning alone.
+    pub border: Option<String>,
+    /// Optional decorative rule below the first heading (#RRGGBB); "none" disables it.
+    pub decoration: Option<String>,
 }
 
-impl Default for EmailTheme {
-    fn default() -> Self {
+impl EmailTheme {
+    /// Request fields override local defaults, which override the neutral palette.
+    pub(crate) fn resolve(&self, local: &Self) -> Self {
+        let accent = self
+            .accent
+            .clone()
+            .or_else(|| local.accent.clone())
+            .unwrap_or_else(|| "#24527a".into());
         Self {
-            accent: "#24527a".into(),
+            link: Some(
+                self.link
+                    .clone()
+                    .or_else(|| local.link.clone())
+                    .unwrap_or_else(|| accent.clone()),
+            ),
+            accent: Some(accent),
+            text: Some(
+                self.text
+                    .clone()
+                    .or_else(|| local.text.clone())
+                    .unwrap_or_else(|| "#202124".into()),
+            ),
+            border: Some(
+                self.border
+                    .clone()
+                    .or_else(|| local.border.clone())
+                    .unwrap_or_else(|| "#667085".into()),
+            ),
+            decoration: Some(
+                self.decoration
+                    .clone()
+                    .or_else(|| local.decoration.clone())
+                    .unwrap_or_else(|| "none".into()),
+            ),
         }
     }
 }

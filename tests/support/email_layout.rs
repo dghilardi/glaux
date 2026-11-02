@@ -6,7 +6,7 @@ use super::*;
 async fn rendered_email_fits_mobile_and_desktop_without_remote_resources() {
     let input = serde_json::from_value(json!({
         "subject":"Synthetic update",
-        "theme":{"accent":"#123456"},
+        "theme":{"accent":"#123456","text":"#292929","link":"#342156","border":"#aabbcc","decoration":"#bbccdd"},
         "html":format!("<h1>Project update</h1><p>Summary of completed work.</p><h2>Next steps</h2><ul><li>Review</li><li>Validation</li></ul><table><caption>Progress</caption><tr><th scope=\"col\">Task</th><th scope=\"col\">State</th></tr><tr><td>Implementation</td><td>Ready</td></tr></table><p><a href=\"https://example.test/report\">https://example.test/{}</a></p><pre>{}</pre>", "long".repeat(40), "code".repeat(40))
     })).unwrap();
     let prepared = glaux::compose::prepare(&input).unwrap();
@@ -52,7 +52,7 @@ async fn rendered_email_fits_mobile_and_desktop_without_remote_resources() {
         assert_eq!(result["fits"], true, "viewport {width}: {result}");
         assert!(result["width"].as_f64().unwrap() <= 640.0);
         assert_eq!(result["font"], "16px");
-        assert_eq!(result["link"], "rgb(18, 52, 86)");
+        assert_eq!(result["link"], "rgb(52, 33, 86)");
         assert_eq!(result["tables"], 1);
         assert_eq!(result["remote"], 0);
     }

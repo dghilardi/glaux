@@ -437,7 +437,11 @@ async fn socket_clients_and_archive_work_share_the_owned_browser() {
         let output = directory.path().join("client-export.eml");
         let email = EmailInput {
             theme: glaux::compose::EmailTheme {
-                accent: "#123456".into(),
+                accent: Some("#123456".into()),
+                text: Some("#292929".into()),
+                link: Some("#342156".into()),
+                border: Some("#aabbcc".into()),
+                decoration: Some("#bbccdd".into()),
             },
             to: vec![],
             cc: vec![],

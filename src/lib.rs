@@ -54,6 +54,25 @@ pub enum Operation {
     Status,
 }
 
+/// Resolve before forwarding so the service cannot change the client's preview palette.
+fn resolve_email_theme(config: &config::Config, operation: &mut Operation) -> Result<()> {
+    match operation {
+        Operation::PreviewEmail { email }
+        | Operation::CreateDraft { email, .. }
+        | Operation::UpdateDraft { email, .. }
+            if email.theme.accent.is_none()
+                || email.theme.text.is_none()
+                || email.theme.link.is_none()
+                || email.theme.border.is_none()
+                || email.theme.decoration.is_none() =>
+        {
+            email.theme = email.theme.resolve(&config.email_theme()?);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Validate locally, before profile access or forwarding to the session owner.
 pub(crate) fn validate_operation(
     config: &config::Config,
@@ -112,8 +131,9 @@ pub(crate) fn validate_operation(
 pub(crate) async fn execute_in_browser(
     config: &config::Config,
     browser: &mut browser::Browser,
-    operation: Operation,
+    mut operation: Operation,
 ) -> Result<Value> {
+    resolve_email_theme(config, &mut operation)?;
     if let Some(local) = validate_operation(config, &operation)? {
         return Ok(local);
     }
@@ -169,7 +189,8 @@ pub(crate) async fn execute_in_browser(
 }
 
 /// Prefer the daemon for online operations; never retry a submitted service call.
-pub async fn execute(config: &config::Config, operation: Operation) -> Result<Value> {
+pub async fn execute(config: &config::Config, mut operation: Operation) -> Result<Value> {
+    resolve_email_theme(config, &mut operation)?;
     if let Some(local) = validate_operation(config, &operation)? {
         return Ok(local);
     }
@@ -198,7 +219,11 @@ pub async fn execute(config: &config::Config, operation: Operation) -> Result<Va
 }
 
 /// Every standalone operation closes Chromium on success, errors and signals.
-pub async fn execute_standalone(config: &config::Config, operation: Operation) -> Result<Value> {
+pub async fn execute_standalone(
+    config: &config::Config,
+    mut operation: Operation,
+) -> Result<Value> {
+    resolve_email_theme(config, &mut operation)?;
     if let Some(local) = validate_operation(config, &operation)? {
         return Ok(local);
     }
@@ -226,4 +251,41 @@ pub fn terminal_text(value: &str) -> String {
                 && !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
         })
         .collect()
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+    #[test]
+    fn resolved_theme_survives_forwarding_and_configuration_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config =
+            config::Config::new(Some(dir.path().into()), None, config::DEFAULT_URL, false, 1)
+                .unwrap();
+        let path = dir.path().join("email-theme.toml");
+        std::fs::write(
+            &path,
+            "accent = '#123456'\ntext = '#292929'\nborder = '#aabbcc'\n",
+        )
+        .unwrap();
+        let mut operation = Operation::PreviewEmail {
+            email: serde_json::from_value(json!({"subject":"Synthetic", "html":"<h1>Title</h1><p>Body</p>", "theme":{"link":"#342156"}})).unwrap(),
+        };
+        resolve_email_theme(&config, &mut operation).unwrap();
+        let before = validate_operation(&config, &operation).unwrap().unwrap();
+        // The wire representation must freeze every field, including no decoration.
+        let mut forwarded: Operation =
+            serde_json::from_value(serde_json::to_value(&operation).unwrap()).unwrap();
+        std::fs::write(&path, "accent = '#654321'\ndecoration = '#aabbcc'\n").unwrap();
+        resolve_email_theme(&config, &mut forwarded).unwrap();
+        assert_eq!(
+            before,
+            validate_operation(&config, &forwarded).unwrap().unwrap()
+        );
+        let html = before["email"]["html"].as_str().unwrap();
+        assert!(html.contains("color:#123456"));
+        assert!(html.contains("color:#292929"));
+        assert!(!html.contains("border-bottom:2px"));
+    }
 }

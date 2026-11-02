@@ -6,11 +6,11 @@ use std::sync::OnceLock;
 
 pub(crate) const SIGNATURE_SLOT: &str = "<!--glaux-signature-slot-->";
 
-fn document(content: &str) -> Result<String> {
+fn document(content: &str, text: &str) -> Result<String> {
     // Only validated HTML enters mj-text. Includes, remote loaders and arbitrary MJML
     // are not exposed, and MRML is compiled without filesystem or HTTP loaders.
     let source = format!(
-        r##"<mjml><mj-body width="640px" background-color="#ffffff"><mj-section padding="0 16px" text-align="left"><mj-column width="100%" padding="0"><mj-text font-family="Arial,Helvetica,sans-serif" font-size="16px" line-height="1.5" color="#202124" padding="0" align="left">{content}</mj-text><mj-raw>{SIGNATURE_SLOT}</mj-raw></mj-column></mj-section></mj-body></mjml>"##
+        r##"<mjml><mj-body width="640px" background-color="#ffffff"><mj-section padding="0 16px" text-align="left"><mj-column width="100%" padding="0"><mj-text font-family="Arial,Helvetica,sans-serif" font-size="16px" line-height="1.5" color="{text}" padding="0" align="left">{content}</mj-text><mj-raw>{SIGNATURE_SLOT}</mj-raw></mj-column></mj-section></mj-body></mjml>"##
     );
     let root = mrml::parse(&source).map_err(|_| anyhow::anyhow!("email_render_failed"))?;
     root.element
@@ -28,7 +28,7 @@ fn allowances() -> Option<&'static (Vec<String>, Vec<String>)> {
     static ALLOWED: OnceLock<Option<(Vec<String>, Vec<String>)>> = OnceLock::new();
     ALLOWED
         .get_or_init(|| {
-            let html = Html::parse_document(&document("").ok()?);
+            let html = Html::parse_document(&document("", "#202124").ok()?);
             let comments = html
                 .tree
                 .root()
@@ -58,13 +58,12 @@ pub(crate) fn allows_head_style(value: &str) -> bool {
     allowances().is_some_and(|a| a.1.contains(&normalized(value)))
 }
 
-fn accent(theme: &EmailTheme) -> Result<String> {
-    let value = &theme.accent;
+fn color(value: &str, name: &str, text: bool) -> Result<String> {
     ensure!(
         value.len() == 7
             && value.starts_with('#')
             && value.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit),
-        "invalid_theme_accent: use #RRGGBB"
+        "invalid_theme_{name}: use #RRGGBB"
     );
     let mut luminance = 0.0;
     for (offset, weight) in [(1, 0.2126), (3, 0.7152), (5, 0.0722)] {
@@ -77,14 +76,25 @@ fn accent(theme: &EmailTheme) -> Result<String> {
         luminance += weight * linear;
     }
     ensure!(
-        1.05 / (luminance + 0.05) >= 4.5,
-        "invalid_theme_accent: contrast against white must be at least 4.5:1"
+        !text || 1.05 / (luminance + 0.05) >= 4.5,
+        "invalid_theme_{name}: contrast against white must be at least 4.5:1"
     );
     Ok(value.to_ascii_lowercase())
 }
 
 pub(crate) fn render(mut fragment: Html, theme: &EmailTheme) -> Result<String> {
-    let accent = accent(theme)?;
+    let theme = theme.resolve(&EmailTheme::default());
+    let accent = color(theme.accent.as_deref().unwrap(), "accent", true)?;
+    let text = color(theme.text.as_deref().unwrap(), "text", true)?;
+    let link = color(theme.link.as_deref().unwrap(), "link", true)?;
+    let border = color(theme.border.as_deref().unwrap(), "border", false)?;
+    let decoration = theme
+        .decoration
+        .as_deref()
+        .filter(|v| *v != "none")
+        .map(|v| color(v, "decoration", false))
+        .transpose()?;
+    let mut decorated = false;
     let ids = fragment
         .tree
         .root()
@@ -96,24 +106,32 @@ pub(crate) fn render(mut fragment: Html, theme: &EmailTheme) -> Result<String> {
         let Node::Element(element) = node.value() else {
             continue;
         };
-        let style = match element.name() {
+        let mut style = match element.name() {
             "p" => "margin:0 0 16px".into(),
             "h1" => format!("margin:24px 0 12px;font-size:26px;line-height:1.3;color:{accent}"),
             "h2" => format!("margin:24px 0 12px;font-size:22px;line-height:1.3;color:{accent}"),
             "h3" | "h4" | "h5" | "h6" => format!("margin:20px 0 10px;font-size:18px;line-height:1.4;color:{accent}"),
-            "a" => format!("color:{accent};text-decoration:underline"),
+            "a" => format!("color:{link};text-decoration:underline"),
             "ul" | "ol" => "margin:0 0 16px 24px;padding:0".into(),
             "li" => "margin-bottom:6px".into(),
-            "blockquote" => "margin:16px 0;padding:8px 16px;border-left:3px solid #667085".into(),
+            "blockquote" => format!("margin:16px 0;padding:8px 16px;border-left:3px solid {border}"),
             "pre" => "margin:16px 0;white-space:pre-wrap;font-family:Consolas,monospace".into(),
             "code" => "font-family:Consolas,monospace".into(),
             "table" => "width:100%;border-collapse:collapse;margin:16px 0".into(),
-            "th" => "font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.5;padding:8px;border:1px solid #667085;text-align:left;vertical-align:top;font-weight:bold".into(),
-            "td" => "font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.5;padding:8px;border:1px solid #667085;vertical-align:top".into(),
+            "th" => format!("font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.5;padding:8px;border:1px solid {border};color:{text};text-align:left;vertical-align:top;font-weight:bold"),
+            "td" => format!("font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.5;padding:8px;border:1px solid {border};color:{text};vertical-align:top"),
             "caption" => "font-family:Arial,Helvetica,sans-serif;font-size:16px;text-align:left;font-weight:bold;margin-bottom:8px".into(),
-            "hr" => "border:0;border-top:1px solid #667085;margin:24px 0".into(),
+            "hr" => format!("border:0;border-top:1px solid {border};margin:24px 0"),
             _ => continue,
         };
+        if !decorated && matches!(element.name(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+            decorated = true;
+            if let Some(color) = &decoration {
+                style.push_str(&format!(
+                    ";border-bottom:2px solid {color};padding-bottom:12px"
+                ));
+            }
+        }
         // All authored attributes have already passed compose::prepare. Only this renderer
         // can introduce styles, and the accent above contains no CSS syntax.
         let mut name = element.name.clone();
@@ -143,9 +161,10 @@ pub(crate) fn render(mut fragment: Html, theme: &EmailTheme) -> Result<String> {
         rest = &rest[end..];
     }
     content.push_str(rest);
-    document(&format!(
-        "<div style=\"overflow-wrap:anywhere\">{content}</div>"
-    ))
+    document(
+        &format!("<div style=\"overflow-wrap:anywhere;color:{text}\">{content}</div>"),
+        &text,
+    )
 }
 
 #[cfg(test)]
@@ -167,7 +186,7 @@ mod tests {
         let mut email = input(
             "<h2>Update</h2><p><a href=\"https://example.test/?a=1&amp;b=2\">Report</a></p><table><tr><th scope=\"col\">Item</th><th>State</th></tr><tr><td colspan=\"2\">Ready</td></tr></table><pre>code &lt;value&gt;</pre>",
         );
-        email.theme.accent = "#123456".into();
+        email.theme.accent = Some("#123456".into());
         let rendered = prepare(&email).unwrap();
         assert!(rendered.html.contains("color:#123456"));
         assert!(rendered.html.contains("max-width:640px"));
@@ -198,17 +217,59 @@ mod tests {
             "#12345",
         ] {
             let mut email = input("<p>Hello</p>");
-            email.theme.accent = color.into();
+            email.theme.accent = Some(color.into());
             let error = prepare(&email).err().unwrap().to_string();
             assert!(error.starts_with("invalid_theme_accent:"));
             assert!(!error.contains(color));
         }
-        assert!(
-            accent(&EmailTheme {
-                accent: "#767676".into()
-            })
-            .is_ok()
+        assert!(color("#767676", "accent", true).is_ok());
+    }
+
+    #[test]
+    fn validates_each_color_and_only_decorates_the_first_heading() {
+        let mut email = input(
+            "<h1>Title</h1><h2>Section</h2><p>Body</p><a href=\"https://example.test\">Link</a><table><tr><td>Cell</td></tr></table><hr>",
         );
+        email.theme = serde_json::from_value(serde_json::json!({
+            "text":"#292929", "accent":"#123456", "link":"#342156",
+            "border":"#aabbcc", "decoration":"#bbccdd"
+        }))
+        .unwrap();
+        let rendered = prepare(&email).unwrap();
+        assert_eq!(
+            rendered
+                .html
+                .matches("border-bottom:2px solid #bbccdd")
+                .count(),
+            1
+        );
+        assert!(
+            rendered
+                .html
+                .contains("border:1px solid #aabbcc;color:#292929")
+        );
+        assert!(
+            rendered
+                .html
+                .contains("color:#342156;text-decoration:underline")
+        );
+        for field in ["accent", "text", "link", "border", "decoration"] {
+            for value in ["#123456;display:none", "#éabcd"] {
+                let mut theme = serde_json::to_value(&email.theme).unwrap();
+                theme[field] = value.into();
+                let mut invalid = email.clone();
+                invalid.theme = serde_json::from_value(theme).unwrap();
+                let error = prepare(&invalid).err().unwrap().to_string();
+                assert_eq!(error, format!("invalid_theme_{field}: use #RRGGBB"));
+            }
+        }
+        for field in ["accent", "text", "link"] {
+            let mut theme = serde_json::to_value(&email.theme).unwrap();
+            theme[field] = "#ffffff".into();
+            let mut invalid = email.clone();
+            invalid.theme = serde_json::from_value(theme).unwrap();
+            assert!(prepare(&invalid).is_err());
+        }
     }
 
     #[test]

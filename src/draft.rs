@@ -608,7 +608,11 @@ pub(crate) mod tests {
         let mut input = crate::compose::tests::input(
             "<h2>Update</h2><p><a href=\"https://example.test/report\">Report</a></p><table><tr><th scope=\"col\">Task</th><th>State</th></tr><tr><td>One</td><td>Ready</td></tr></table><blockquote>Note</blockquote><pre>code</pre><hr>",
         );
-        input.theme.accent = "#123456".into();
+        input.theme.accent = Some("#123456".into());
+        input.theme.text = Some("#292929".into());
+        input.theme.link = Some("#342156".into());
+        input.theme.border = Some("#d0d0d0".into());
+        input.theme.decoration = Some("#bbccdd".into());
         let prepared = prepare(&input).unwrap();
         let signature = Signature::from_mime(TEMPLATE).unwrap();
         let mime = signature.mime(&prepared).unwrap();

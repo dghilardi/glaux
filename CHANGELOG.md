@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Local email theme configuration shared by CLI and MCP, with separate text, heading, link, border and decorative colors, per-email overrides and contrast validation.
+
 ## [0.6.0] 2026-11-02
 
 ### Added

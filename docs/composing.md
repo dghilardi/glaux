@@ -64,13 +64,24 @@ Glaux validates the authored HTML, applies its deterministic local MRML renderer
 
 Existing email objects keep working and now receive a neutral, single-column presentation: a fluid body capped at 640 px with 16 px side padding, 16 px Arial/Helvetica text, distinct headings, readable spacing, underlined links and bordered data tables. Only the authored body is styled; the signature keeps its supported Outlook formatting and inline images. MRML supplies presentation tables, head styles and conditional Outlook markup for the fixed single-column layout. It is built without HTTP or filesystem include loaders. No external fonts, stylesheets or image resources are introduced or fetched by the renderer.
 
-The optional theme controls only the accent used for headings and links:
+Theme fields can be configured separately: `accent` for headings (and links unless `link` is set), `text` for body text, `link`, `border` for data-table borders and horizontal rules, and `decoration` for an optional decorative rule below the first heading. All colors use exactly `#RRGGBB`; text, accent and link require at least 4.5:1 contrast against white. Borders and decoration never convey information alone. Use `decoration = "none"` to disable the rule. Fonts, white background, width and spacing remain controlled by the renderer.
 
-```json
-"theme": {"accent": "#24527a"}
+Save optional local defaults in `email-theme.toml` inside Glaux's data directory (`~/.local/share/glaux/email-theme.toml` on Linux, or the directory selected by `--data-dir` / `GLAUX_DATA_DIR`). The file contains only theme keys, without a section wrapper:
+
+```toml
+accent = "#24527a"
+text = "#202124"
+border = "#a0a0a0"
+decoration = "none"
 ```
 
-The default accent is `#24527a`. Custom accents must use exactly `#RRGGBB` and have at least 4.5:1 contrast against the renderer's white background. The body uses dark text on white. Other theme keys, arbitrary CSS, classes, document wrappers and raw MJML remain unsupported as authored input. Theme validation happens locally before browser startup or socket submission. The theme travels with the email over the daemon protocol, so preview and save use the same options without separate client and daemon theme configuration. Both client and daemon need a version supporting this field; upgrade them together.
+The file is read for each composition request, including calls in an already-running MCP process; palette changes do not require a restart. Unknown keys, invalid TOML and files exceeding 16 KiB are rejected without echoing their contents. An absent file retains neutral defaults. CLI and MCP share the same resolution: per-email fields override local configuration, then neutral defaults. Omitted fields (including JSON `null`) inherit. An explicit `link` takes precedence over the accent fallback.
+
+```json
+"theme": {"accent": "#24527a", "decoration": "none"}
+```
+
+Theme validation happens before browser startup or socket submission. The resolved theme travels with the email over the daemon protocol, preserving preview/save consistency even if the daemon has different local defaults. Both client and daemon must support these fields; upgrade them together. The pure Rust `compose::prepare` function uses only explicit fields and neutral defaults; local file resolution belongs to the operation layer. Local palettes and brand assets belong outside the repository; the renderer contains no brand presets. Arbitrary CSS, classes, document wrappers and raw MJML remain unsupported.
 
 Tables preserve their captions, headers, spans and row/column relationships. They are never automatically rewritten into cards. Prefer headings and lists for status updates intended for small screens; complex or wide tables can still require more space. Long URLs and preformatted text wrap where supported. Rendering adds markup, so the rendered body and the final body with its signature must also fit the 256 KiB HTML limit. A composed document that exceeds the supported nesting depth is rejected before saving.
 

@@ -83,6 +83,16 @@ async fn mcp_stdio_discovery_and_errors_without_opening_browser() {
         assert!(payload["data"]["email"]["text"].as_str().unwrap().contains("Caffè & attività"));
         let email = serde_json::from_value(preview["params"]["arguments"].clone()).unwrap();
         assert_eq!(payload["data"]["email"]["html"], glaux::compose::prepare(&email).unwrap().html);
+        // Existing MCP processes reload local defaults without a restart.
+        for color in ["#123456", "#654321"] {
+            std::fs::write(dir.path().join("email-theme.toml"), format!("accent = '{color}'\nborder = '#aabbcc'\n")).unwrap();
+            let call = json!({"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"preview_email","arguments":{"subject":"Synthetic","html":"<h1>Title</h1><p>Body</p>"}}});
+            stdin.write_all(format!("{call}\n").as_bytes()).await.unwrap();
+            let response: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+            assert_ne!(response["result"]["isError"], true);
+            let payload: Value = serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert!(payload["data"]["email"]["html"].as_str().unwrap().contains(&format!("color:{color}")));
+        }
         let disabled = json!({"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"create_draft","arguments":{"email":{"subject":"Synthetic","html":"<p>Body</p>"},"signature_draft_id":"fixture"}}});
         stdin.write_all(format!("{disabled}\n").as_bytes()).await.unwrap();
         let response: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
@@ -326,4 +336,56 @@ async fn daemon_handles_reprocess_requests_during_browser_failure_backoff() {
         assert!(archive.contains("synthetic").unwrap());
         assert_eq!(std::fs::read_dir(settings.archive_dir.join("messages/monitoring")).unwrap().count(), 1);
     }).await.unwrap();
+}
+
+#[tokio::test]
+async fn cli_local_theme_overrides_and_invalid_settings_stay_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = dir.path().join("email-theme.toml");
+    let input = dir.path().join("email.json");
+    std::fs::write(&input, r##"{"subject":"Synthetic","html":"<h1>Title</h1><p>Body</p><table><tr><td>Cell</td></tr></table>","theme":{"accent":"#342156"}}"##).unwrap();
+    for (source, valid) in [
+        (
+            "accent = '#123456'\ntext = '#292929'\nborder = '#aabbcc'\ndecoration = '#bbccdd'\n",
+            true,
+        ),
+        ("text = '#ffffff'\n", false),
+        ("accent = 'PRIVATE_SENTINEL'\n", false),
+        ("css = 'PRIVATE_SENTINEL'\n", false),
+        ("PRIVATE_SENTINEL not valid TOML", false),
+    ] {
+        std::fs::write(&settings, source).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_glaux"))
+            .arg("--data-dir")
+            .arg(dir.path())
+            .args(["--browser", "/bin/false", "preview-email", "--input"])
+            .arg(&input)
+            .output()
+            .await
+            .unwrap();
+        // An invalid default overridden by the request is never used or rendered.
+        let expected = valid || source.starts_with("accent = 'PRIVATE_SENTINEL'");
+        assert_eq!(output.status.success(), expected);
+        if valid {
+            let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let html = response["data"]["email"]["html"].as_str().unwrap();
+            assert!(html.contains("color:#342156"));
+            assert!(!html.contains("color:#123456"));
+            assert!(html.contains("color:#292929"));
+            assert!(html.contains("border:1px solid #aabbcc"));
+        }
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("PRIVATE_SENTINEL"));
+        assert!(!dir.path().join("browser-profile").exists());
+    }
+    std::fs::write(&settings, "x".repeat(16 * 1024 + 1)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_glaux"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .args(["--browser", "/bin/false", "preview-email", "--input"])
+        .arg(&input)
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("email_theme_config_too_large"));
 }

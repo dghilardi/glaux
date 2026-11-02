@@ -96,6 +96,27 @@ impl Config {
             standalone: false,
         })
     }
+    /// Read only composition settings, never browser/session state. Reload per operation.
+    pub(crate) fn email_theme(&self) -> Result<crate::compose::EmailTheme> {
+        use std::io::Read;
+        let path = self.data_dir.join("email-theme.toml");
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Default::default());
+            }
+            Err(_) => bail!("email_theme_config_unreadable"),
+        };
+        let mut bytes = Vec::new();
+        file.take(16 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| anyhow::anyhow!("email_theme_config_unreadable"))?;
+        anyhow::ensure!(bytes.len() <= 16 * 1024, "email_theme_config_too_large");
+        let source = std::str::from_utf8(&bytes)
+            .map_err(|_| anyhow::anyhow!("invalid_email_theme_config"))?;
+        toml::from_str(source).map_err(|_| anyhow::anyhow!("invalid_email_theme_config"))
+    }
+
     pub fn profile(&self) -> PathBuf {
         self.data_dir.join("browser-profile")
     }
