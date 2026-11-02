@@ -24,6 +24,7 @@ struct Fixture {
     write_status: u16,
     corrupt_readback: bool,
     conflict_on_update: bool,
+    write_error_code: Option<&'static str>,
 }
 
 impl Fixture {
@@ -35,6 +36,7 @@ impl Fixture {
             write_status: 200,
             corrupt_readback: false,
             conflict_on_update: false,
+            write_error_code: None,
         }
     }
 
@@ -50,6 +52,12 @@ impl Fixture {
                 assert_eq!(body["MessageDisposition"], "SaveOnly");
                 if self.write_status != 200 {
                     return (self.write_status, json!({}));
+                }
+                if let Some(code) = self.write_error_code {
+                    return (
+                        200,
+                        json!({"Body":{"ResponseMessages":{"Items":[{"ResponseClass":"Error","ResponseCode":code}]}}}),
+                    );
                 }
                 let mut item = if action == "CreateItem" {
                     assert_eq!(body["SavedItemFolderId"]["BaseFolderId"]["Id"], "drafts");
@@ -113,9 +121,12 @@ impl Fixture {
                         .collect::<String>()
                 };
                 let rewritten = html.replace("<html>", "<html><head><style type=\"text/css\">P {margin-top:0;margin-bottom:0;}</style></head>");
-                let rewritten = String::from_utf8(mime)
-                    .unwrap()
-                    .replace(&encoded(&html), &encoded(&rewritten));
+                let original = String::from_utf8(mime).unwrap();
+                let rewritten = original.replace(&encoded(&html), &encoded(&rewritten));
+                assert_ne!(
+                    rewritten, original,
+                    "fixture must exercise Exchange MIME rewriting"
+                );
                 item["MimeContent"]["Value"] = json!(STANDARD.encode(rewritten));
                 if self.corrupt_readback {
                     item["MimeContent"]["Value"] = json!(STANDARD.encode(TEMPLATE_MIME));
@@ -320,6 +331,27 @@ async fn draft_writes_preserve_templates_reject_conflicts_and_never_retry() {
             assert!(error.to_string().contains("draft_save_unconfirmed"));
             assert_eq!(state.lock().await.writes, before + 1);
         }
+        state.lock().await.write_status = 200;
+        for (code, outcome) in [
+            ("ErrorAccessDenied", "draft_save_rejected"),
+            ("ErrorTimeoutExpired", "draft_save_unconfirmed"),
+            ("ErrorInternalServerError", "draft_save_unconfirmed"),
+            (
+                "ErrorInternalServerTransientError",
+                "draft_save_unconfirmed",
+            ),
+            ("ErrorServerBusy", "draft_save_unconfirmed"),
+            ("ErrorUnknownFixture", "draft_save_unconfirmed"),
+        ] {
+            let before = state.lock().await.writes;
+            state.lock().await.write_error_code = Some(code);
+            let error = owa::create_draft(&mut browser, &config, &email, "signature-template")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(outcome));
+            assert_eq!(state.lock().await.writes, before + 1);
+        }
+        state.lock().await.write_error_code = None;
         {
             let mut fixture = state.lock().await;
             fixture.write_status = 200;

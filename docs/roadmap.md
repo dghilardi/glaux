@@ -9,7 +9,7 @@
 - Online status, local diagnostics and local session removal; one data directory per account.
 - Cross-process profile lock and serialized MCP calls.
 - MCP stdio server with `list_messages` and `read_message`.
-- Local `preview_email`, with semantic HTML validation and derived plain text. Experimental opt-in `create_draft`/`update_draft` use an Outlook signature template; live tenant validation is pending.
+- Local `preview_email`, with semantic HTML validation and derived plain text. Experimental opt-in `create_draft`/`update_draft` use an Outlook signature template; recipient-free create/update passed on one live session, with the [full checklist still incomplete](live-validation.md#recorded-validation-2026-11-02).
 - MIME export to private EML files and a local archive classified by header rules.
 - Repeatable sync with a persisted cursor, integrity checks, polling with backoff and an optional systemd user unit.
 - Optional unattended passkey sign-in with an external authenticator gated on the session lock.

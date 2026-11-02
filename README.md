@@ -11,7 +11,7 @@ Glaux is named after the Greek word for owl. It was inspired by [Owl for Exchang
 
 Early prototype (0.1.0), tested on Linux with Chromium against one commercial Microsoft 365 tenant. It works there for listing, reading, MIME export, a local EML archive and MCP access. Other tenants, operating systems, Exchange on-premises and government clouds are untested.
 
-Mailbox access is **read-only by default** (`FindItem` and `GetItem`). Experimental, explicitly enabled [draft composition](docs/composing.md) adds `CreateItem`/`UpdateItem` with `SaveOnly`; it has not been validated against a live tenant. Glaux never sends, deletes, moves or marks messages as read.
+Mailbox access is **read-only by default** (`FindItem` and `GetItem`). Experimental, explicitly enabled [draft composition](docs/composing.md) adds `CreateItem`/`UpdateItem` with `SaveOnly`; recipient-free creation and updates passed on one live session, with [remaining validation limits](docs/live-validation.md#recorded-validation-2026-11-02). Glaux never sends, deletes, moves or marks messages as read.
 
 ## How it works
 

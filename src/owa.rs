@@ -536,7 +536,7 @@ async fn save_draft(
             });
         error.context(match rejection {
             Some("ErrorIrresolvableConflict" | "ErrorChangeKeyRequired" | "ErrorInvalidChangeKey" | "ErrorChangeKeyRequiredForWriteOperations") => "draft_conflict: the server rejected the stale version; read the draft again before updating",
-            Some(code) if code.starts_with("Error") => "draft_save_rejected: OWA refused the draft write",
+            Some("ErrorAccessDenied" | "ErrorInvalidProperty" | "ErrorInvalidPropertySet" | "ErrorInvalidPropertyRequest" | "ErrorInvalidRecipients" | "ErrorInvalidIdMalformed" | "ErrorItemNotFound" | "ErrorInvalidRequest") => "draft_save_rejected: OWA refused the draft write",
             _ => "draft_save_unconfirmed: inspect Outlook Drafts before retrying",
         })
     })?;
