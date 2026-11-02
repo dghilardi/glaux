@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
-- Controlled inline email presentation shared by previews and drafts, with a configurable high-contrast accent, readable typography and preserved data tables; signature formatting remains separate. Recipient-free live OWA creation and content readback passed on one session; the owner confirmed the rendered draft and signature look correct in Outlook. External synthetic screenshots also cover representative mobile, web and dark-mode clients, with remaining classic Outlook layout limitations documented.
+- Controlled email presentation shared by previews and drafts through a local MJML/MRML layout, with a configurable high-contrast accent, Outlook compatibility markup and preserved data tables. Signature templates remain strict; saved MIME recognizes only the fixed renderer’s head rules and comments. Verification status and limits are recorded in the live-validation checklist.
 
 ### Changed
 

@@ -10,10 +10,7 @@ async fn rendered_email_fits_mobile_and_desktop_without_remote_resources() {
         "html":format!("<h1>Project update</h1><p>Summary of completed work.</p><h2>Next steps</h2><ul><li>Review</li><li>Validation</li></ul><table><caption>Progress</caption><tr><th scope=\"col\">Task</th><th scope=\"col\">State</th></tr><tr><td>Implementation</td><td>Ready</td></tr></table><p><a href=\"https://example.test/report\">https://example.test/{}</a></p><pre>{}</pre>", "long".repeat(40), "code".repeat(40))
     })).unwrap();
     let prepared = glaux::compose::prepare(&input).unwrap();
-    let body = format!(
-        "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head><body>{}</body></html>",
-        prepared.html
-    );
+    let body = prepared.html;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -51,7 +48,7 @@ async fn rendered_email_fits_mobile_and_desktop_without_remote_resources() {
             )
             .await
             .unwrap();
-        let result = browser.cdp.evaluate("({fits:document.documentElement.scrollWidth <= innerWidth, width:document.body.firstElementChild.getBoundingClientRect().width, font:getComputedStyle(document.body.firstElementChild).fontSize, link:getComputedStyle(document.querySelector('a')).color, tables:document.querySelectorAll('table').length, remote:performance.getEntriesByType('resource').filter(r=>!r.name.startsWith(location.origin)).length})").await.unwrap();
+        let result = browser.cdp.evaluate("({fits:document.documentElement.scrollWidth <= innerWidth, width:document.querySelector('div[style*=\"max-width:640px\"]').getBoundingClientRect().width, font:getComputedStyle(document.querySelector('div[style*=\"font-family:Arial\"]')).fontSize, link:getComputedStyle(document.querySelector('a')).color, tables:document.querySelectorAll('table:not([role=presentation])').length, remote:performance.getEntriesByType('resource').filter(r=>!r.name.startsWith(location.origin)).length})").await.unwrap();
         assert_eq!(result["fits"], true, "viewport {width}: {result}");
         assert!(result["width"].as_f64().unwrap() <= 640.0);
         assert_eq!(result["font"], "16px");

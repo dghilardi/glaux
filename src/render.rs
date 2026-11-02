@@ -2,6 +2,59 @@
 use crate::compose::EmailTheme;
 use anyhow::{Result, ensure};
 use scraper::{Html, Node};
+use std::sync::OnceLock;
+
+fn document(content: &str) -> Result<String> {
+    // Only validated HTML enters mj-text. Includes, remote loaders and arbitrary MJML
+    // are not exposed, and MRML is compiled without filesystem or HTTP loaders.
+    let source = format!(
+        r##"<mjml><mj-body width="640px" background-color="#ffffff"><mj-section padding="0" text-align="left"><mj-column width="100%" padding="0"><mj-text font-family="Arial,Helvetica,sans-serif" font-size="16px" line-height="1.5" color="#202124" padding="0" align="left">{content}</mj-text></mj-column></mj-section></mj-body></mjml>"##
+    );
+    let root = mrml::parse(&source).map_err(|_| anyhow::anyhow!("email_render_failed"))?;
+    root.element
+        .render(&mrml::prelude::render::RenderOptions::default())
+        .map_err(|_| anyhow::anyhow!("email_render_failed"))
+}
+
+fn normalized(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// Derive the allowlist from the same fixed template/version, never from message input.
+// It permits only the engine's own head CSS and Outlook compatibility comments.
+fn allowances() -> Option<&'static (Vec<String>, Vec<String>)> {
+    static ALLOWED: OnceLock<Option<(Vec<String>, Vec<String>)>> = OnceLock::new();
+    ALLOWED
+        .get_or_init(|| {
+            let html = Html::parse_document(&document("").ok()?);
+            let comments = html
+                .tree
+                .root()
+                .descendants()
+                .filter_map(|n| {
+                    if let Node::Comment(value) = n.value() {
+                        Some(normalized(value))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let styles = html
+                .select(&scraper::Selector::parse("head style").unwrap())
+                .map(|e| normalized(&e.text().collect::<String>()))
+                .collect();
+            Some((comments, styles))
+        })
+        .as_ref()
+}
+
+pub(crate) fn allows_comment(value: &str) -> bool {
+    allowances().is_some_and(|a| a.0.contains(&normalized(value)))
+}
+
+pub(crate) fn allows_head_style(value: &str) -> bool {
+    allowances().is_some_and(|a| a.1.contains(&normalized(value)))
+}
 
 fn accent(theme: &EmailTheme) -> Result<String> {
     let value = &theme.accent;
@@ -47,15 +100,15 @@ pub(crate) fn render(mut fragment: Html, theme: &EmailTheme) -> Result<String> {
             "h2" => format!("margin:24px 0 12px;font-size:22px;line-height:1.3;color:{accent}"),
             "h3" | "h4" | "h5" | "h6" => format!("margin:20px 0 10px;font-size:18px;line-height:1.4;color:{accent}"),
             "a" => format!("color:{accent};text-decoration:underline"),
-            "ul" | "ol" => "margin:0 0 16px;padding-left:24px".into(),
+            "ul" | "ol" => "margin:0 0 16px 24px;padding:0".into(),
             "li" => "margin-bottom:6px".into(),
             "blockquote" => "margin:16px 0;padding:8px 16px;border-left:3px solid #667085".into(),
             "pre" => "margin:16px 0;white-space:pre-wrap;font-family:Consolas,monospace".into(),
             "code" => "font-family:Consolas,monospace".into(),
             "table" => "width:100%;border-collapse:collapse;margin:16px 0".into(),
-            "th" => "padding:8px;border:1px solid #667085;text-align:left;vertical-align:top;font-weight:bold".into(),
-            "td" => "padding:8px;border:1px solid #667085;vertical-align:top".into(),
-            "caption" => "text-align:left;font-weight:bold;margin-bottom:8px".into(),
+            "th" => "font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.5;padding:8px;border:1px solid #667085;text-align:left;vertical-align:top;font-weight:bold".into(),
+            "td" => "font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.5;padding:8px;border:1px solid #667085;vertical-align:top".into(),
+            "caption" => "font-family:Arial,Helvetica,sans-serif;font-size:16px;text-align:left;font-weight:bold;margin-bottom:8px".into(),
             "hr" => "border:0;border-top:1px solid #667085;margin:24px 0".into(),
             _ => continue,
         };
@@ -71,9 +124,25 @@ pub(crate) fn render(mut fragment: Html, theme: &EmailTheme) -> Result<String> {
             .unwrap_err();
         element.attrs.insert(index, (name, style.into()));
     }
-    Ok(format!(
-        "<div style=\"width:100%;max-width:640px;box-sizing:border-box;font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.5;color:#202124;background-color:#ffffff;overflow-wrap:anywhere\">{}</div>",
-        fragment.root_element().inner_html()
+    let html = fragment.root_element().inner_html();
+    // Word-based clients do not consistently honor white-space on pre. Explicit
+    // breaks preserve the authored newlines without interpreting text as markup.
+    let mut content = String::new();
+    let mut rest = html.as_str();
+    while let Some(start) = rest.find("<pre ") {
+        let end = rest[start..].find("</pre>").unwrap() + start + "</pre>".len();
+        content.push_str(&rest[..start]);
+        content.push_str(
+            &rest[start..end]
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+                .replace('\n', "<br>"),
+        );
+        rest = &rest[end..];
+    }
+    content.push_str(rest);
+    document(&format!(
+        "<div style=\"overflow-wrap:anywhere\">{content}</div>"
     ))
 }
 
@@ -151,5 +220,21 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn mjml_layout_keeps_outlook_width_and_explicit_code_breaks() {
+        let prepared = prepare(&input(
+            "<ul><li>One</li><li>Two</li></ul><pre>first\nsecond &lt;tag&gt;</pre>",
+        ))
+        .unwrap();
+        assert!(prepared.html.starts_with("<!doctype html>"));
+        assert!(prepared.html.contains("<!--[if mso | IE]>"));
+        assert!(prepared.html.contains("width=\"640\""));
+        assert!(prepared.html.contains("margin:0 0 16px 24px"));
+        assert!(prepared.html.contains("first<br />second &lt;tag&gt;"));
+        assert!(prepared.text.contains("first\nsecond <tag>"));
+        assert!(!prepared.text.contains('─'));
+        assert!(!prepared.html.contains("fonts.googleapis"));
     }
 }

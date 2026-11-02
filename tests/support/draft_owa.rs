@@ -120,7 +120,10 @@ impl Fixture {
                         .map(|line| format!("{}\r\n", std::str::from_utf8(line).unwrap()))
                         .collect::<String>()
                 };
-                let rewritten = html.replace("<html>", "<html><head><style type=\"text/css\">P {margin-top:0;margin-bottom:0;}</style></head>");
+                let rewritten = html.replace(
+                    "</head>",
+                    "<style type=\"text/css\">P {margin-top:0;margin-bottom:0;}</style></head>",
+                );
                 let original = String::from_utf8(mime).unwrap();
                 let rewritten = original.replace(&encoded(&html), &encoded(&rewritten));
                 assert_ne!(

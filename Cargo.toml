@@ -37,6 +37,7 @@ toml = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "signal", "io-util", "io-std", "sync", "net"] }
 tokio-tungstenite = "0.30"
 url = "2"
+mrml = { version = "6.0.1", default-features = false, features = ["parse", "render"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "process"] }

@@ -22,6 +22,14 @@ pub(crate) struct Signature {
 
 impl Signature {
     pub fn from_mime(bytes: &[u8]) -> Result<Self> {
+        Self::parse(bytes, false)
+    }
+
+    fn from_saved(bytes: &[u8]) -> Result<Self> {
+        Self::parse(bytes, true)
+    }
+
+    fn parse(bytes: &[u8], rendered: bool) -> Result<Self> {
         ensure!(
             bytes.len() <= MAX_MIME_BYTES,
             "signature_template_too_large"
@@ -43,13 +51,14 @@ impl Signature {
         })?;
         ensure!(html.len() <= MAX_HTML_BYTES, "signature_template_too_large");
         let mut document = Html::parse_document(&html);
-        inline_outlook_paragraph_reset(&mut document)?;
-        validate_signature(&document, &images)?;
+        inline_outlook_paragraph_reset(&mut document, rendered)?;
+        validate_signature(&document, &images, rendered)?;
         let body = document
             .select(&Selector::parse("body").unwrap())
             .next()
             .ok_or_else(|| anyhow::anyhow!("invalid_signature_html"))?;
-        // Only Outlook's known paragraph reset is inlined; other head styles are refused.
+        // Template CSS stays strict. Saved MRML head rules are recognized then discarded
+        // only in this readback representation; the stored message retains them.
         Ok(Self {
             html: wrap_signature(
                 document.root_element(),
@@ -61,7 +70,7 @@ impl Signature {
 
     /// Refuse to discard attachments added independently in Outlook.
     pub fn check_existing_images(&self, existing: &[u8]) -> Result<()> {
-        let current = Self::from_mime(existing)?;
+        let current = Self::from_saved(existing)?;
         ensure!(
             self.images == current.images,
             "draft_attachments_changed: inline images differ from the signature template; edit this draft in Outlook"
@@ -70,12 +79,15 @@ impl Signature {
     }
 
     pub fn mime(&self, email: &PreparedEmail) -> Result<Vec<u8>> {
-        let html = format!(
-            "<html><body><div>{}</div><div>{}</div></body></html>",
-            email.html, self.html
-        );
+        let body = email
+            .html
+            .strip_suffix("</body></html>")
+            .ok_or_else(|| anyhow::anyhow!("invalid_rendered_document"))?;
+        let html = format!("{body}<div>{}</div></body></html>", self.html);
         ensure!(html.len() <= MAX_HTML_BYTES, "composed_html_too_large");
-        validate_signature(&Html::parse_document(&html), &self.images)?;
+        let mut checked = Html::parse_document(&html);
+        inline_outlook_paragraph_reset(&mut checked, true)?;
+        validate_signature(&checked, &self.images, true)?;
         let text = plain_text(&html)?;
         let digest = format!("{:x}", Sha256::digest(html.as_bytes()));
         // RFC 2046 limits boundary values to 70 characters, including our prefix.
@@ -128,7 +140,7 @@ impl Signature {
     }
 }
 
-fn inline_outlook_paragraph_reset(document: &mut Html) -> Result<()> {
+fn inline_outlook_paragraph_reset(document: &mut Html, rendered: bool) -> Result<()> {
     let styles = document
         .select(&Selector::parse("style").unwrap())
         .map(|style| {
@@ -136,23 +148,26 @@ fn inline_outlook_paragraph_reset(document: &mut Html) -> Result<()> {
                 ElementRef::wrap(node).is_some_and(|element| element.value().name() == "head")
             });
             let css = style.text().collect::<String>();
+            if rendered && in_head && crate::render::allows_head_style(&css) {
+                return Ok((style.id(), false));
+            }
             let css: String = css.chars().filter(|c| !c.is_whitespace()).collect();
             ensure!(
                 in_head
                     && matches!(css.to_ascii_lowercase().as_str(), "p{margin-top:0;margin-bottom:0;}" | "p{margin-top:0;margin-bottom:0}"),
                 "unsupported_signature_stylesheet: only Outlook's paragraph margin reset is supported"
             );
-            Ok(style.id())
+            Ok((style.id(), true))
         })
         .collect::<Result<Vec<_>>>()?;
-    if styles.is_empty() {
-        return Ok(());
-    }
     let paragraphs = document
         .select(&Selector::parse("body p").unwrap())
         .map(|element| element.id())
         .collect::<Vec<_>>();
-    for id in paragraphs {
+    for id in paragraphs
+        .into_iter()
+        .filter(|_| styles.iter().any(|(_, reset)| *reset))
+    {
         let mut node = document.tree.get_mut(id).unwrap();
         if let Node::Element(element) = node.value() {
             let style = format!(
@@ -169,7 +184,7 @@ fn inline_outlook_paragraph_reset(document: &mut Html) -> Result<()> {
             }
         }
     }
-    for id in styles {
+    for (id, _) in styles {
         document.tree.get_mut(id).unwrap().detach();
     }
     Ok(())
@@ -204,7 +219,7 @@ fn encode_body(target: &mut String, bytes: &[u8]) {
 /// Exchange may normalize MIME. Compare envelope, visible content, links and image bytes,
 /// and require the stored plain-text alternative to agree with the stored HTML.
 pub(crate) fn verify_saved(expected: &[u8], actual: &[u8]) -> Result<()> {
-    let expected_signature = Signature::from_mime(expected)?;
+    let expected_signature = Signature::from_saved(expected)?;
     expected_signature.check_existing_images(actual)?;
     let expected_mail =
         mailparse::parse_mail(expected).map_err(|_| anyhow::anyhow!("invalid_composed_mime"))?;
@@ -252,7 +267,7 @@ pub(crate) fn verify_saved(expected: &[u8], actual: &[u8]) -> Result<()> {
     let mut texts = Vec::new();
     plain_parts(&actual_mail, &mut texts)?;
     ensure!(texts.len() == 1, "saved_plain_text_missing_or_ambiguous");
-    let actual_signature = Signature::from_mime(actual)?;
+    let actual_signature = Signature::from_saved(actual)?;
     let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let expected_text = normalize(&plain_text(&expected_signature.html)?);
     let actual_html_text = normalize(&plain_text(&actual_signature.html)?);
@@ -338,17 +353,22 @@ fn collect(
     Ok(())
 }
 
-fn validate_signature(document: &Html, images: &BTreeMap<String, InlineImage>) -> Result<()> {
+fn validate_signature(
+    document: &Html,
+    images: &BTreeMap<String, InlineImage>,
+    rendered: bool,
+) -> Result<()> {
     for node in document.tree.root().descendants() {
         ensure!(
             node.ancestors().take(66).count() <= 64,
             "signature_html_too_deep"
         );
         ensure!(
-            !matches!(
-                node.value(),
-                Node::Comment(_) | Node::ProcessingInstruction(_)
-            ),
+            match node.value() {
+                Node::Comment(value) => rendered && crate::render::allows_comment(value),
+                Node::ProcessingInstruction(_) => false,
+                _ => true,
+            },
             "unsupported_signature_html: comments and processing instructions are not supported"
         );
         if let Node::Element(element) = node.value() {
@@ -442,7 +462,26 @@ fn validate_signature(document: &Html, images: &BTreeMap<String, InlineImage>) -
                             );
                         }
                     }
-                    "style" => validate_style(value)?,
+                    "role" if rendered => ensure!(
+                        (element.name() == "table" && value == "presentation")
+                            || (element.name() == "div" && value == "article"),
+                        "unsupported_rendered_role"
+                    ),
+                    "aria-roledescription" if rendered && element.name() == "div" => {
+                        ensure!(value == "email", "unsupported_rendered_role")
+                    }
+                    "xmlns" | "xmlns:v" | "xmlns:o" if rendered && element.name() == "html" => {
+                        ensure!(
+                            matches!(
+                                value,
+                                "http://www.w3.org/1999/xhtml"
+                                    | "urn:schemas-microsoft-com:vml"
+                                    | "urn:schemas-microsoft-com:office:office"
+                            ),
+                            "unsupported_rendered_namespace"
+                        )
+                    }
+                    "style" => validate_style(value, rendered)?,
                     "id" | "class" | "dir" | "lang" | "title" | "alt" | "align" | "valign"
                     | "width" | "height" | "border" | "cellpadding" | "cellspacing" | "colspan"
                     | "rowspan" | "scope" | "color" | "face" | "size" => {}
@@ -457,56 +496,67 @@ fn validate_signature(document: &Html, images: &BTreeMap<String, InlineImage>) -
     Ok(())
 }
 
-fn validate_style(style: &str) -> Result<()> {
+fn validate_style(style: &str, rendered: bool) -> Result<()> {
     for declaration in style.split(';').filter(|d| !d.trim().is_empty()) {
         let (property, value) = declaration
             .split_once(':')
             .ok_or_else(|| anyhow::anyhow!("unsupported_signature_style"))?;
         let property = property.trim().to_ascii_lowercase();
         let value = value.trim().to_ascii_lowercase();
-        ensure!(
-            [
-                "font",
-                "font-family",
-                "font-size",
-                "font-weight",
-                "font-style",
-                "color",
-                "background-color",
-                "text-decoration",
-                "text-align",
-                "text-indent",
-                "letter-spacing",
-                "box-sizing",
-                "vertical-align",
-                "line-height",
-                "margin",
-                "margin-top",
-                "margin-bottom",
-                "margin-left",
-                "margin-right",
-                "padding",
-                "padding-top",
-                "padding-bottom",
-                "padding-left",
-                "padding-right",
-                "border",
-                "border-top",
-                "border-bottom",
-                "border-left",
-                "border-right",
-                "border-collapse",
-                "border-spacing",
-                "width",
-                "height",
-                "max-width",
-                "min-width",
-                "min-height",
-                "display",
-                "white-space",
-                "overflow-wrap"
+        let passive = [
+            "font",
+            "font-family",
+            "font-size",
+            "font-weight",
+            "font-style",
+            "color",
+            "background-color",
+            "text-decoration",
+            "text-align",
+            "text-indent",
+            "letter-spacing",
+            "box-sizing",
+            "vertical-align",
+            "line-height",
+            "margin",
+            "margin-top",
+            "margin-bottom",
+            "margin-left",
+            "margin-right",
+            "padding",
+            "padding-top",
+            "padding-bottom",
+            "padding-left",
+            "padding-right",
+            "border",
+            "border-top",
+            "border-bottom",
+            "border-left",
+            "border-right",
+            "border-collapse",
+            "border-spacing",
+            "width",
+            "height",
+            "max-width",
+            "min-width",
+            "min-height",
+            "display",
+            "white-space",
+            "overflow-wrap",
+        ]
+        .contains(&property.as_str());
+        let generated = rendered
+            && [
+                "direction",
+                "word-break",
+                "word-spacing",
+                "mso-table-lspace",
+                "mso-table-rspace",
+                "mso-line-height-rule",
             ]
-            .contains(&property.as_str())
+            .contains(&property.as_str());
+        ensure!(
+            (passive || generated)
                 && !["url", "expression", "var(", "attr("]
                     .iter()
                     .any(|s| value.contains(s))
@@ -525,6 +575,27 @@ pub(crate) mod tests {
     use crate::compose::{EmailInput, prepare};
 
     #[test]
+    fn renderer_exceptions_do_not_authorize_untrusted_template_markup() {
+        let input = crate::compose::tests::input("<p>Body</p>");
+        let prepared = prepare(&input).unwrap();
+        let signature = Signature::from_mime(TEMPLATE).unwrap();
+        let mime = signature.mime(&prepared).unwrap();
+        assert!(Signature::from_mime(&mime).is_err());
+        verify_saved(&mime, &mime).unwrap();
+        for injected in [
+            "<!--[if mso]><script>secret</script><![endif]-->",
+            "<style>body {background:url(https://example.test/secret)}</style>",
+        ] {
+            let mut poisoned = prepared.clone();
+            poisoned.html = poisoned
+                .html
+                .replace("</head>", &format!("{injected}</head>"));
+            let error = signature.mime(&poisoned).err().unwrap().to_string();
+            assert!(!error.contains("secret"));
+        }
+    }
+
+    #[test]
     fn rendered_body_roundtrips_without_restyling_signature() {
         let mut input = crate::compose::tests::input(
             "<h2>Update</h2><p><a href=\"https://example.test/report\">Report</a></p><table><tr><th scope=\"col\">Task</th><th>State</th></tr><tr><td>One</td><td>Ready</td></tr></table><blockquote>Note</blockquote><pre>code</pre><hr>",
@@ -534,8 +605,8 @@ pub(crate) mod tests {
         let signature = Signature::from_mime(TEMPLATE).unwrap();
         let mime = signature.mime(&prepared).unwrap();
         verify_saved(&mime, &mime).unwrap();
-        let saved = Signature::from_mime(&mime).unwrap();
-        assert!(saved.html.contains(&prepared.html));
+        let saved = Signature::from_saved(&mime).unwrap();
+        assert!(saved.html.contains("max-width:640px"));
         assert!(saved.html.contains("font-family:Arial;color:rgb(1, 2, 3)"));
         signature.check_existing_images(&mime).unwrap();
     }

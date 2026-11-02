@@ -1,7 +1,7 @@
 //! Local email composition. No browser, external resources or independently supplied text body.
 use anyhow::{Result, bail, ensure};
 use rmcp::schemars;
-use scraper::{Html, Node};
+use scraper::{ElementRef, Html, Node};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_HTML_BYTES: usize = 256 * 1024;
@@ -196,7 +196,35 @@ pub fn prepare(input: &EmailInput) -> Result<PreparedEmail> {
 }
 
 pub(crate) fn plain_text(html: &str) -> Result<String> {
-    html2text::from_read(html.as_bytes(), 100)
+    // Presentation tables constrain email clients, but must not add ASCII boxes or
+    // padding to the text alternative. Preserve authored data tables inside them.
+    let mut document = Html::parse_document(html);
+    let layout = document
+        .tree
+        .root()
+        .descendants()
+        .filter_map(|node| {
+            let element = ElementRef::wrap(node)?;
+            if !matches!(
+                element.value().name(),
+                "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th"
+            ) {
+                return None;
+            }
+            node.ancestors()
+                .filter_map(ElementRef::wrap)
+                .find(|e| e.value().name() == "table")
+                .filter(|e| e.value().attr("role") == Some("presentation"))
+                .map(|_| node.id())
+        })
+        .collect::<Vec<_>>();
+    for id in layout {
+        if let Node::Element(element) = document.tree.get_mut(id).unwrap().value() {
+            element.name.local = "div".into();
+            element.attrs.clear();
+        }
+    }
+    html2text::from_read(document.html().as_bytes(), 100)
         .map_err(|_| anyhow::anyhow!("plain_text_conversion_failed"))
 }
 

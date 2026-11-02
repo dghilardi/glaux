@@ -10,6 +10,7 @@ A single Rust package provides the `glaux` library and binary. The CLI and the M
 - `cdp.rs`: sequential CDP websocket, response correlation and observation of OWA request headers. A context is accepted only from a successful response on the exact `/owa/service.svc` path; `requestWillBeSentExtraInfo` may arrive before or after the request and response.
 - `owa.rs`: `FindItem`/`GetItem` payloads, opt-in `SaveOnly` draft writes, in-page fetch transport and response normalization.
 - `compose.rs`: local semantic HTML and recipient validation, normalization and plain-text derivation.
+- `render.rs`: fixed local MJML/MRML layout, controlled accent, Outlook compatibility markup and an internally derived readback allowlist; no include loaders or remote resources.
 - `draft.rs`: validated Outlook signature templates, related inline images, multipart alternatives and saved-MIME consistency checks.
 - `export.rs`: atomic, non-overwriting publication of private EML files; the MIME comes from the server.
 - `archive.rs`: local classification rules, archive integrity, SQLite state, backfill cursor, explicit per-item exclusions, opt-in retention and polling with backoff.
