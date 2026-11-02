@@ -16,13 +16,14 @@ use tokio::{
     sync::Mutex,
 };
 
-const TEMPLATE_MIME: &[u8] = b"From: owner@example.test\r\nDate: Mon, 2 Nov 2026 10:00:00 +0000\r\nContent-Type: multipart/related; boundary=fixture\r\n\r\n--fixture\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><p style=\"font-family:Arial\">Synthetic signature<img src=\"cid:logo@example.test\" alt=\"Logo\"></p></body></html>\r\n--fixture\r\nContent-Type: image/png\r\nContent-ID: <logo@example.test>\r\nContent-Transfer-Encoding: base64\r\n\r\nc3ludGhldGljLWltYWdl\r\n--fixture--\r\n";
+const TEMPLATE_MIME: &[u8] = b"From: owner@example.test\r\nDate: Mon, 2 Nov 2026 10:00:00 +0000\r\nContent-Type: multipart/related; boundary=fixture\r\n\r\n--fixture\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><head><style type=\"text/css\">P {margin-top:0;margin-bottom:0;}</style></head><body><p style=\"font-family:Aptos_EmbeddedFont\">Synthetic signature <a href=\"https://example.test/\" target=\"_blank\" rel=\"noopener noreferrer\">Link</a><img src=\"cid:logo@example.test\" alt=\"Logo\"></p></body></html>\r\n--fixture\r\nContent-Type: image/png\r\nContent-ID: <logo@example.test>\r\nContent-Transfer-Encoding: base64\r\n\r\nc3ludGhldGljLWltYWdl\r\n--fixture--\r\n";
 
 struct Fixture {
     items: HashMap<String, Value>,
     writes: usize,
     write_status: u16,
     corrupt_readback: bool,
+    conflict_on_update: bool,
 }
 
 impl Fixture {
@@ -33,6 +34,7 @@ impl Fixture {
             writes: 0,
             write_status: 200,
             corrupt_readback: false,
+            conflict_on_update: false,
         }
     }
 
@@ -56,10 +58,18 @@ impl Fixture {
                     assert_eq!(body["ConflictResolution"], "NeverOverwrite");
                     let change = &body["ItemChanges"][0];
                     assert_eq!(change["ItemId"]["Id"], "created-draft");
-                    assert_eq!(
-                        change["ItemId"]["ChangeKey"],
-                        self.items["created-draft"]["ItemId"]["ChangeKey"]
-                    );
+                    if self.conflict_on_update {
+                        self.items.get_mut("created-draft").unwrap()["ItemId"]["ChangeKey"] =
+                            json!("concurrent-version");
+                    }
+                    if change["ItemId"]["ChangeKey"]
+                        != self.items["created-draft"]["ItemId"]["ChangeKey"]
+                    {
+                        return (
+                            200,
+                            json!({"Body":{"ResponseMessages":{"Items":[{"ResponseClass":"Error","ResponseCode":"ErrorIrresolvableConflict"}]}}}),
+                        );
+                    }
                     let mut item = self.items["created-draft"].clone();
                     for update in change["Updates"].as_array().unwrap() {
                         let field = update["Path"]["FieldURI"].as_str().unwrap();
@@ -82,6 +92,31 @@ impl Fixture {
                     json!({"Id":"created-draft","ChangeKey":format!("version-{}", self.writes)});
                 item["IsDraft"] = json!(true);
                 let response = item.clone();
+                // Exchange adds its paragraph reset to stored HTML. Keep this
+                // synthetic rewriting separate from the bytes sent by the client.
+                let mime = STANDARD
+                    .decode(item["MimeContent"]["Value"].as_str().unwrap())
+                    .unwrap();
+                let parsed = mailparse::parse_mail(&mime).unwrap();
+                let html = parsed
+                    .parts()
+                    .find(|part| part.ctype.mimetype == "text/html")
+                    .unwrap()
+                    .get_body()
+                    .unwrap();
+                let encoded = |body: &str| {
+                    STANDARD
+                        .encode(body)
+                        .as_bytes()
+                        .chunks(76)
+                        .map(|line| format!("{}\r\n", std::str::from_utf8(line).unwrap()))
+                        .collect::<String>()
+                };
+                let rewritten = html.replace("<html>", "<html><head><style type=\"text/css\">P {margin-top:0;margin-bottom:0;}</style></head>");
+                let rewritten = String::from_utf8(mime)
+                    .unwrap()
+                    .replace(&encoded(&html), &encoded(&rewritten));
+                item["MimeContent"]["Value"] = json!(STANDARD.encode(rewritten));
                 if self.corrupt_readback {
                     item["MimeContent"]["Value"] = json!(STANDARD.encode(TEMPLATE_MIME));
                 }
@@ -256,6 +291,26 @@ async fn draft_writes_preserve_templates_reject_conflicts_and_never_retry() {
         .unwrap();
         assert_eq!(result["verified"], true);
         assert_eq!(result["change_key"], "version-2");
+        let before_conflict = state.lock().await.items["created-draft"]["MimeContent"].clone();
+        state.lock().await.conflict_on_update = true;
+        let error = owa::update_draft(
+            &mut browser,
+            &config,
+            &email,
+            "signature-template",
+            "created-draft",
+            "version-2",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("draft_conflict"));
+        assert!(!error.to_string().contains("draft_save_unconfirmed"));
+        assert_eq!(state.lock().await.writes, 3);
+        assert_eq!(
+            state.lock().await.items["created-draft"]["MimeContent"],
+            before_conflict
+        );
+        state.lock().await.conflict_on_update = false;
         for status in [401, 440, 429, 0] {
             let before = state.lock().await.writes;
             state.lock().await.write_status = status;

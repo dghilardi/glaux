@@ -69,7 +69,7 @@ Date, operating system, browser version, OWA host and the outcome of login, list
 
 ## Drafts: opt-in manual validation
 
-This checklist is **pending**. Synthetic loopback tests do not demonstrate OWA write compatibility on any live tenant. Run these checks only with the account owner's authorization to create and update test drafts. Do not enable sending or change installed services as part of validation.
+This checklist is **partially validated**; the full checklist remains incomplete. Synthetic loopback tests do not demonstrate OWA write compatibility on any live tenant. Run these checks only with the account owner's authorization to create and update test drafts. Do not enable sending or change installed services as part of validation.
 
 1. Prepare a signature-only HTML draft in Outlook as described in [composition](composing.md). Include a Unicode signature, a link and a CID logo if applicable; leave all recipients empty. Wait for Outlook to save it. Keep its ID private and do not paste the content into issues.
 2. Confirm default MCP discovery contains only the three read-only tools. A valid local preview must work without starting Chromium; invalid HTML/addresses must fail locally, including when the draft policy is enabled.
@@ -80,3 +80,9 @@ This checklist is **pending**. Synthetic loopback tests do not demonstrate OWA w
 7. If a save is unconfirmed, inspect Drafts yourself before any retry. Use loopback tests, not a real mailbox, to inject network/authentication failures. Confirm normal shutdown leaves the dedicated profile reusable.
 
 Record only date, platform/browser/host and aggregate outcomes: create, update, conflicts, signature, CID image, HTML/text preservation and template immutability. In particular, verify the tenant accepts these internal OWA MIME write payloads; EWS documentation is not proof. Broader tenant/platform support remains unverified until separately checked.
+
+### Recorded validation, 2026-11-02
+
+On Linux with Chromium 155.0.8059.84, one existing Microsoft 365 session passed CLI list/read/status reuse and MCP read-only discovery/list/read. The explicit draft-policy MCP invocation exposed five tools and no send tool. Creating one recipient-free test draft and updating the same item both returned `saved: true`, `is_draft: true` and `verified: true`. The stored MIME passed the HTML/text consistency check. The signature template's exported MIME remained byte-for-byte unchanged; stale ChangeKeys and attempts to update the template were rejected. The account owner confirmed the signature, logo, links and formatting looked correct in Outlook. The daemon was restored after each validation invocation.
+
+The template used external HTTPS images, so live CID image preservation remains untested. Live recipient fields (including Bcc MIME behavior), server-side concurrent edits, sent/addressed/extra-attachment rejection, and persistence after a reboot or 24 hours remain pending. Server-side conflicts, CID images, attachment guards and uncertain saves are covered by synthetic loopback tests. This records one tenant/session only and does not establish broader support.

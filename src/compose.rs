@@ -44,6 +44,14 @@ pub fn prepare(input: &EmailInput) -> Result<PreparedEmail> {
             address.len() <= 254
                 && address.is_ascii()
                 && !address.chars().any(char::is_whitespace)
+                && address.split_once('@').is_some_and(|(local, domain)| {
+                    local
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b".!#$%&'*+-/=?^_`{|}~".contains(&b))
+                        && domain
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+                })
                 && email_address::EmailAddress::is_valid(address),
             "invalid_recipient: use a bare email address"
         );
@@ -245,6 +253,11 @@ mod tests {
         email.subject = "Synthetic".into();
         email.to = vec!["secret\n@example.test".into()];
         assert!(prepare(&email).is_err());
+        for address in ["\"a,b\"@example.test", "robot@[127.0.0.1]"] {
+            email.to = vec![address.into()];
+            let error = prepare(&email).err().expect("unsupported address syntax");
+            assert!(!error.to_string().contains(address));
+        }
         email.to = vec!["robot@example.test".into(); MAX_RECIPIENTS + 1];
         assert!(prepare(&email).is_err());
         email.to.clear();

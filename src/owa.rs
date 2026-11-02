@@ -524,8 +524,22 @@ async fn save_draft(
     mime: &[u8],
 ) -> Result<Value> {
     let response = request(browser, config, action, payload).await.context("draft_save_unconfirmed: inspect Outlook Drafts before retrying; writes are never retried automatically")?;
-    let messages = response_messages(&response)
-        .context("draft_save_unconfirmed: inspect Outlook Drafts before retrying")?;
+    let messages = response_messages(&response).map_err(|error| {
+        let rejection = response.pointer("/Body/ResponseMessages/Items")
+            .and_then(Value::as_array)
+            .filter(|messages| messages.len() == 1)
+            .and_then(|messages| {
+                let message = &messages[0];
+                (message["ResponseClass"] == "Error")
+                    .then(|| message["ResponseCode"].as_str())
+                    .flatten()
+            });
+        error.context(match rejection {
+            Some("ErrorIrresolvableConflict" | "ErrorChangeKeyRequired" | "ErrorInvalidChangeKey" | "ErrorChangeKeyRequiredForWriteOperations") => "draft_conflict: the server rejected the stale version; read the draft again before updating",
+            Some(code) if code.starts_with("Error") => "draft_save_rejected: OWA refused the draft write",
+            _ => "draft_save_unconfirmed: inspect Outlook Drafts before retrying",
+        })
+    })?;
     let item = messages.first().and_then(|m| m["Items"].as_array()).and_then(|items| items.first()).context("draft_save_unconfirmed: no saved item returned; inspect Outlook Drafts before retrying")?;
     let id = item.pointer("/ItemId/Id").and_then(Value::as_str).context(
         "draft_save_unconfirmed: no saved ID returned; inspect Outlook Drafts before retrying",

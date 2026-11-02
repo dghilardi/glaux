@@ -42,13 +42,14 @@ impl Signature {
             anyhow::anyhow!("signature_template_requires_html: create an HTML draft in Outlook")
         })?;
         ensure!(html.len() <= MAX_HTML_BYTES, "signature_template_too_large");
-        let document = Html::parse_document(&html);
+        let mut document = Html::parse_document(&html);
+        inline_outlook_paragraph_reset(&mut document)?;
         validate_signature(&document, &images)?;
         let body = document
             .select(&Selector::parse("body").unwrap())
             .next()
             .ok_or_else(|| anyhow::anyhow!("invalid_signature_html"))?;
-        // Outlook uses inline formatting. Head styles cannot be preserved by this first version.
+        // Only Outlook's known paragraph reset is inlined; other head styles are refused.
         Ok(Self {
             html: wrap_signature(
                 document.root_element(),
@@ -123,6 +124,53 @@ impl Signature {
         ensure!(mime.len() <= MAX_MIME_BYTES, "composed_message_too_large");
         Ok(mime.into_bytes())
     }
+}
+
+fn inline_outlook_paragraph_reset(document: &mut Html) -> Result<()> {
+    let styles = document
+        .select(&Selector::parse("style").unwrap())
+        .map(|style| {
+            let in_head = style.ancestors().any(|node| {
+                ElementRef::wrap(node).is_some_and(|element| element.value().name() == "head")
+            });
+            let css = style.text().collect::<String>();
+            let css: String = css.chars().filter(|c| !c.is_whitespace()).collect();
+            ensure!(
+                in_head
+                    && matches!(css.to_ascii_lowercase().as_str(), "p{margin-top:0;margin-bottom:0;}" | "p{margin-top:0;margin-bottom:0}"),
+                "unsupported_signature_stylesheet: only Outlook's paragraph margin reset is supported"
+            );
+            Ok(style.id())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if styles.is_empty() {
+        return Ok(());
+    }
+    let paragraphs = document
+        .select(&Selector::parse("body p").unwrap())
+        .map(|element| element.id())
+        .collect::<Vec<_>>();
+    for id in paragraphs {
+        let mut node = document.tree.get_mut(id).unwrap();
+        if let Node::Element(element) = node.value() {
+            let style = format!(
+                "margin-top:0;margin-bottom:0;{}",
+                element.attr("style").unwrap_or_default()
+            );
+            let mut name = element.name.clone();
+            name.local = "style".into();
+            name.ns = "".into();
+            name.prefix = None;
+            match element.attrs.binary_search_by(|(key, _)| key.cmp(&name)) {
+                Ok(index) => element.attrs[index].1 = style.into(),
+                Err(index) => element.attrs.insert(index, (name, style.into())),
+            }
+        }
+    }
+    for id in styles {
+        document.tree.get_mut(id).unwrap().detach();
+    }
+    Ok(())
 }
 
 // Preserve inherited formatting/direction on the source html/body without embedding
@@ -302,6 +350,13 @@ fn validate_signature(document: &Html, images: &BTreeMap<String, InlineImage>) -
             "unsupported_signature_html: comments and processing instructions are not supported"
         );
         if let Node::Element(element) = node.value() {
+            if matches!(element.name(), "meta" | "title") {
+                ensure!(
+                    node.ancestors().any(|parent| ElementRef::wrap(parent)
+                        .is_some_and(|element| element.value().name() == "head")),
+                    "unsupported_signature_html: metadata is only supported in the discarded head"
+                );
+            }
             ensure!(
                 [
                     "html",
@@ -355,6 +410,22 @@ fn validate_signature(document: &Html, images: &BTreeMap<String, InlineImage>) -
                 );
                 match name {
                     "href" if element.name() == "a" => crate::compose::validate_link(value)?,
+                    "target" if element.name() == "a" => {
+                        ensure!(
+                            matches!(value, "_blank" | "_self"),
+                            "unsupported_signature_link_target"
+                        );
+                    }
+                    "rel" if element.name() == "a" => {
+                        ensure!(
+                            value.split_ascii_whitespace().all(|token| matches!(
+                                token,
+                                "noopener" | "noreferrer" | "nofollow"
+                            )),
+                            "unsupported_signature_link_relation"
+                        );
+                    }
+                    "originalsrc" if element.name() == "a" => crate::compose::validate_link(value)?,
                     "src" if element.name() == "img" => {
                         if let Some(cid) = value.strip_prefix("cid:") {
                             ensure!(images.contains_key(cid), "signature_image_not_found");
@@ -402,6 +473,9 @@ fn validate_style(style: &str) -> Result<()> {
                 "background-color",
                 "text-decoration",
                 "text-align",
+                "text-indent",
+                "letter-spacing",
+                "box-sizing",
                 "vertical-align",
                 "line-height",
                 "margin",
@@ -425,6 +499,7 @@ fn validate_style(style: &str) -> Result<()> {
                 "height",
                 "max-width",
                 "min-width",
+                "min-height",
                 "display",
                 "white-space"
             ]
@@ -434,7 +509,7 @@ fn validate_style(style: &str) -> Result<()> {
                     .any(|s| value.contains(s))
                 && value
                     .chars()
-                    .all(|c| c.is_alphanumeric() || c == ' ' || "#,.%()-'\"!".contains(c)),
+                    .all(|c| c.is_alphanumeric() || c == ' ' || "#,.%()-'\"!_/".contains(c)),
             "unsupported_signature_style"
         );
     }
@@ -529,6 +604,52 @@ pub(crate) mod tests {
             let error = Signature::from_mime(bad.as_bytes())
                 .err()
                 .expect("unsafe template");
+            assert!(!error.to_string().contains("secret"));
+        }
+    }
+
+    #[test]
+    fn accepts_outlook_fonts_links_and_inlines_only_the_known_head_reset() {
+        let template = String::from_utf8(TEMPLATE.to_vec()).unwrap()
+            .replace("<html>", "<html><head><meta charset=\"utf-8\"><style type=\"text/css\"> P {margin-top:0;margin-bottom:0;} </style></head>")
+            .replace("font-family:Arial", "font-family:Aptos_EmbeddedFont;font:12px/1.4 Aptos_MSFontService;letter-spacing:normal;text-indent:0px;box-sizing:border-box;min-height:10px")
+            .replace("Signature<img", "<p style=\"margin-top:4px\">Signature <a href=\"https://example.test/\" target=\"_blank\" rel=\"noopener noreferrer\">Link</a></p><img");
+        let signature = Signature::from_mime(template.as_bytes()).unwrap();
+        assert!(!signature.html.contains("<style"));
+        assert!(
+            signature
+                .html
+                .contains("margin-top:0;margin-bottom:0;margin-top:4px")
+        );
+        assert!(signature.html.contains("Aptos_EmbeddedFont"));
+        assert!(signature.html.contains("target=\"_blank\""));
+        let email = prepare(&EmailInput {
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Synthetic".into(),
+            html: "<p>Body</p>".into(),
+        })
+        .unwrap();
+        let mime = signature.mime(&email).unwrap();
+        verify_saved(&mime, &mime).unwrap();
+        for bad in [
+            template.replace("margin-top:0;margin-bottom:0;", "color:red;"),
+            template.replace("</head>", "<script>secret</script></head>"),
+            template.replace(
+                "<body>",
+                "<body><meta http-equiv=\"refresh\" content=\"0\">",
+            ),
+            template.replace("target=\"_blank\"", "target=\"secret\""),
+            template.replace("rel=\"noopener noreferrer\"", "rel=\"secret\""),
+            template.replace(
+                "font-family:Aptos_EmbeddedFont",
+                "font-family:url(https://example.test/secret)",
+            ),
+        ] {
+            let error = Signature::from_mime(bad.as_bytes())
+                .err()
+                .expect("unsupported template");
             assert!(!error.to_string().contains("secret"));
         }
     }
