@@ -3,7 +3,7 @@ name = "glaux"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Read-only Microsoft 365 mail from the terminal and MCP, through Outlook on the web"
+description = "Microsoft 365 mail and opt-in drafts from the terminal and MCP, through Outlook on the web"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dghilardi/glaux"
 readme = "README.md"
@@ -20,12 +20,15 @@ anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 directories = "6"
+email_address = "0.2"
 fs2 = "0.4"
 futures-util = { version = "0.3", features = ["sink"] }
+html2text = "0.16"
 mailparse = "0.16"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 rmcp = { version = "3.7", features = ["server", "transport-io", "schemars"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
+scraper = { version = "0.29", default-features = false, features = ["errors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

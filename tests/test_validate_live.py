@@ -61,7 +61,7 @@ for line in sys.stdin:
         reply = json.loads(sys.stdin.readline())
         assert reply["id"] == request["id"] and reply["result"] == {}
         result = {"tools": [{"name": name, "annotations": {"readOnlyHint": True}}
-                            for name in ("list_messages", "read_message")]}
+                            for name in ("list_messages", "read_message", "preview_email")]}
     elif method == "tools/call":
         if mode == "mcp-hang":
             hang()

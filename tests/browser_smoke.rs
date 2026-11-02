@@ -11,6 +11,9 @@ use tokio::{
     net::TcpListener,
 };
 
+#[path = "support/draft_owa.rs"]
+mod draft_owa;
+
 async fn navigate(browser: &mut Browser, url: &str) {
     browser
         .cdp

@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Local semantic HTML email previews with derived plain text, and opt-in CLI/MCP draft creation and updates using an Outlook signature-only draft, preserving supported formatting and inline images. Draft writes use `SaveOnly`, reject conflicts and are never retried automatically; saved MIME is checked by readback. Live tenant compatibility is not yet validated; sending remains disabled.
+
 ## [0.3.0] 2026-10-26
 
 ### Added

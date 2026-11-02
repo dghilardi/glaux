@@ -1,0 +1,285 @@
+//! Synthetic OWA write fixtures. Never connects to Microsoft or uses a saved account.
+use super::navigate;
+use base64::{Engine, engine::general_purpose::STANDARD};
+use glaux::{
+    browser::Browser,
+    cdp::OwaContext,
+    compose::EmailInput,
+    config::{Config, DEFAULT_URL, MailWritePolicy},
+    owa,
+};
+use serde_json::{Value, json};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    sync::Mutex,
+};
+
+const TEMPLATE_MIME: &[u8] = b"From: owner@example.test\r\nDate: Mon, 2 Nov 2026 10:00:00 +0000\r\nContent-Type: multipart/related; boundary=fixture\r\n\r\n--fixture\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><p style=\"font-family:Arial\">Synthetic signature<img src=\"cid:logo@example.test\" alt=\"Logo\"></p></body></html>\r\n--fixture\r\nContent-Type: image/png\r\nContent-ID: <logo@example.test>\r\nContent-Transfer-Encoding: base64\r\n\r\nc3ludGhldGljLWltYWdl\r\n--fixture--\r\n";
+
+struct Fixture {
+    items: HashMap<String, Value>,
+    writes: usize,
+    write_status: u16,
+    corrupt_readback: bool,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let item = json!({"ItemId":{"Id":"signature-template","ChangeKey":"template-version"},"IsDraft":true,"ToRecipients":[],"CcRecipients":[],"BccRecipients":[],"MimeContent":{"Value":STANDARD.encode(TEMPLATE_MIME)}});
+        Self {
+            items: HashMap::from([("signature-template".into(), item)]),
+            writes: 0,
+            write_status: 200,
+            corrupt_readback: false,
+        }
+    }
+
+    fn respond(&mut self, action: &str, payload: &Value) -> (u16, Value) {
+        let body = &payload["Body"];
+        let item = match action {
+            "GetItem" => {
+                let id = body["ItemIds"][0]["Id"].as_str().unwrap();
+                self.items.get(id).unwrap().clone()
+            }
+            "CreateItem" | "UpdateItem" => {
+                self.writes += 1;
+                assert_eq!(body["MessageDisposition"], "SaveOnly");
+                if self.write_status != 200 {
+                    return (self.write_status, json!({}));
+                }
+                let mut item = if action == "CreateItem" {
+                    assert_eq!(body["SavedItemFolderId"]["BaseFolderId"]["Id"], "drafts");
+                    body["Items"][0].clone()
+                } else {
+                    assert_eq!(body["ConflictResolution"], "NeverOverwrite");
+                    let change = &body["ItemChanges"][0];
+                    assert_eq!(change["ItemId"]["Id"], "created-draft");
+                    assert_eq!(
+                        change["ItemId"]["ChangeKey"],
+                        self.items["created-draft"]["ItemId"]["ChangeKey"]
+                    );
+                    let mut item = self.items["created-draft"].clone();
+                    for update in change["Updates"].as_array().unwrap() {
+                        let field = update["Path"]["FieldURI"].as_str().unwrap();
+                        assert!(
+                            [
+                                "MimeContent",
+                                "Subject",
+                                "ToRecipients",
+                                "CcRecipients",
+                                "BccRecipients"
+                            ]
+                            .contains(&field)
+                        );
+                        item[field] = update["Item"][field].clone();
+                    }
+                    item
+                };
+                assert!(item.get("IsRead").is_none());
+                item["ItemId"] =
+                    json!({"Id":"created-draft","ChangeKey":format!("version-{}", self.writes)});
+                item["IsDraft"] = json!(true);
+                let response = item.clone();
+                if self.corrupt_readback {
+                    item["MimeContent"]["Value"] = json!(STANDARD.encode(TEMPLATE_MIME));
+                }
+                self.items.insert("created-draft".into(), item);
+                response
+            }
+            _ => panic!("Unexpected action in loopback fixture"),
+        };
+        (
+            200,
+            json!({"Body":{"ResponseMessages":{"Items":[{"ResponseClass":"Success","ResponseCode":"NoError","Items":[item]}]}}}),
+        )
+    }
+}
+
+async fn serve(stream: &mut tokio::net::TcpStream, state: Arc<Mutex<Fixture>>) {
+    let mut request = Vec::new();
+    let (end, length) = loop {
+        let mut chunk = [0u8; 8192];
+        let size = stream.read(&mut chunk).await.unwrap();
+        if size == 0 {
+            return;
+        }
+        request.extend_from_slice(&chunk[..size]);
+        assert!(request.len() < 1024 * 1024);
+        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header = std::str::from_utf8(&request[..end]).unwrap();
+            let length = header
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            break (end + 4, length);
+        }
+    };
+    while request.len() < end + length {
+        let mut chunk = [0u8; 8192];
+        let size = stream.read(&mut chunk).await.unwrap();
+        if size == 0 {
+            return;
+        }
+        request.extend_from_slice(&chunk[..size]);
+        assert!(request.len() < 1024 * 1024);
+    }
+    let header = std::str::from_utf8(&request[..end]).unwrap();
+    let (status, body, content_type) = if header.starts_with("POST ") {
+        let payload: Value = serde_json::from_slice(&request[end..end + length]).unwrap();
+        let action = header
+            .lines()
+            .find_map(|line| {
+                line.split_once(':')
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("action"))
+                    .map(|(_, value)| value.trim())
+            })
+            .unwrap();
+        let (status, value) = state.lock().await.respond(action, &payload);
+        (status, value.to_string(), "application/json")
+    } else {
+        (
+            200,
+            "<!doctype html><title>Glaux synthetic OWA</title>".to_owned(),
+            "text/html",
+        )
+    };
+    if status == 0 {
+        return;
+    } // Simulate a lost write response.
+    let response = format!(
+        "HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium; tests draft writes and failures through loopback OWA fixtures"]
+async fn draft_writes_preserve_templates_reject_conflicts_and_never_retry() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let state = Arc::new(Mutex::new(Fixture::new()));
+        let fixture = state.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let state = fixture.clone();
+                tokio::spawn(async move {
+                    serve(&mut stream, state).await;
+                });
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::new(
+            Some(directory.path().join("synthetic-profile")),
+            None,
+            DEFAULT_URL,
+            false,
+            1,
+        )
+        .unwrap();
+        // Even a regression in auth renewal must remain on the loopback fixture.
+        config.url = url::Url::parse(&url).unwrap();
+        let mut browser = Browser::launch(&config, false).await.unwrap();
+        navigate(&mut browser, &url).await;
+        browser.cdp.context = Some(OwaContext {
+            endpoint: format!("{url}owa/service.svc"),
+            headers: HashMap::new(),
+        });
+        let email = EmailInput {
+            to: vec!["reader@example.test".into()],
+            cc: vec!["copy@example.test".into()],
+            bcc: vec!["blind@example.test".into()],
+            subject: "Synthetic subject".into(),
+            html: "<p>Caffè &amp; attività</p>".into(),
+        };
+        assert!(
+            owa::create_draft(&mut browser, &config, &email, "signature-template")
+                .await
+                .is_err()
+        );
+        assert_eq!(state.lock().await.writes, 0);
+        config.mail_write_policy = MailWritePolicy::Drafts;
+        let result = owa::create_draft(&mut browser, &config, &email, "signature-template")
+            .await
+            .unwrap();
+        assert_eq!(result["saved"], true);
+        assert_eq!(result["verified"], true);
+        assert_eq!(state.lock().await.writes, 1);
+        let template = state.lock().await.items["signature-template"].clone();
+        assert_eq!(template["ItemId"]["ChangeKey"], "template-version");
+        assert_eq!(
+            template["MimeContent"]["Value"],
+            STANDARD.encode(TEMPLATE_MIME)
+        );
+        assert!(
+            owa::update_draft(
+                &mut browser,
+                &config,
+                &email,
+                "signature-template",
+                "signature-template",
+                "template-version"
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            owa::update_draft(
+                &mut browser,
+                &config,
+                &email,
+                "signature-template",
+                "created-draft",
+                "stale-version"
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(state.lock().await.writes, 1);
+        let result = owa::update_draft(
+            &mut browser,
+            &config,
+            &email,
+            "signature-template",
+            "created-draft",
+            "version-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["verified"], true);
+        assert_eq!(result["change_key"], "version-2");
+        for status in [401, 440, 429, 0] {
+            let before = state.lock().await.writes;
+            state.lock().await.write_status = status;
+            let error = owa::create_draft(&mut browser, &config, &email, "signature-template")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("draft_save_unconfirmed"));
+            assert_eq!(state.lock().await.writes, before + 1);
+        }
+        {
+            let mut fixture = state.lock().await;
+            fixture.write_status = 200;
+            fixture.corrupt_readback = true;
+        }
+        let result = owa::create_draft(&mut browser, &config, &email, "signature-template")
+            .await
+            .unwrap();
+        assert_eq!(result["saved"], true);
+        assert_eq!(result["verified"], false);
+        assert!(result["warning"].is_string());
+        browser.shutdown().await;
+        assert!(config.lock().is_ok());
+        server.abort();
+    })
+    .await
+    .unwrap();
+}

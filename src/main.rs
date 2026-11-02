@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use glaux::{
     Operation,
-    config::{BrowserPlatform, Config, DEFAULT_URL, find_browser},
+    config::{BrowserPlatform, Config, DEFAULT_URL, MailWritePolicy, find_browser},
     execute, terminal_text,
 };
 use serde_json::{Value, json};
@@ -13,9 +13,18 @@ use std::{io::IsTerminal, path::PathBuf};
     name = "glaux",
     version,
     about = "Your Microsoft 365 mailbox, from the terminal.",
-    long_about = "Read your Microsoft 365 mailbox through an isolated, persistent Outlook Web session. Login opens Chromium for Microsoft SSO/MFA. OWA is an undocumented protocol: live tenant compatibility must be verified."
+    long_about = "Read your Microsoft 365 mailbox through an isolated, persistent Outlook Web session. Email previews run locally; draft writes require an explicit policy and never send mail. Login opens Chromium for Microsoft SSO/MFA. OWA is an undocumented protocol: live tenant compatibility must be verified."
 )]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        env = "GLAUX_MAIL_WRITE_POLICY",
+        value_enum,
+        default_value = "read-only",
+        help = "Mailbox writes: read-only (default) or drafts. Sending is never enabled"
+    )]
+    mail_write_policy: MailWritePolicy,
     #[arg(
         long,
         global = true,
@@ -68,6 +77,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Validate an email JSON file and derive plain text locally; no signature or mailbox access.
+    PreviewEmail {
+        #[arg(long, help = "Email JSON file, or - for stdin")]
+        input: PathBuf,
+    },
+    /// Save an unsent draft with the signature and inline images from an Outlook template.
+    CreateDraft {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(
+            long,
+            help = "OWA ID of a signature-only HTML draft without recipients; never modified"
+        )]
+        signature_draft_id: String,
+    },
+    /// Replace an unsent draft's content, rejecting conflicts and additional attachments.
+    UpdateDraft {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        signature_draft_id: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        change_key: String,
+    },
     /// Open Microsoft login/MFA and verify that the inbox is readable.
     Login,
     /// Check the saved session against OWA (headless unless --headed).
@@ -122,7 +157,7 @@ enum Commands {
     Logout,
     /// Show local configuration diagnostics without signing in.
     Doctor,
-    /// Run a read-only MCP server over stdin/stdout. Login separately first.
+    /// Run the MCP server over stdin/stdout. Draft writes require explicit policy; login separately.
     Mcp,
     /// Run a systemd user authenticator unit only while the local session is unlocked.
     PasskeyGuard {
@@ -158,6 +193,7 @@ async fn run(cli: Cli, json_output: bool) -> Result<()> {
         cli.timeout.unwrap_or(if login { 300 } else { 60 }),
     )?;
     config.browser_platform = cli.browser_platform;
+    config.mail_write_policy = cli.mail_write_policy;
     config.passkey_account = cli
         .passkey_account
         .as_deref()
@@ -215,7 +251,7 @@ async fn run(cli: Cli, json_output: bool) -> Result<()> {
         Commands::Doctor => {
             let browser = find_browser(config.browser.as_ref())?;
             output(
-                &json!({"browser":browser,"data_dir":config.data_dir,"profile_exists":config.profile().exists(),"owa_url":config.url.as_str(),"passkey_sign_in":config.passkey_account.is_some(),"live_compatibility":"not checked by doctor"}),
+                &json!({"browser":browser,"data_dir":config.data_dir,"profile_exists":config.profile().exists(),"owa_url":config.url.as_str(),"passkey_sign_in":config.passkey_account.is_some(),"draft_writes":config.mail_write_policy == MailWritePolicy::Drafts,"live_compatibility":"not checked by doctor"}),
                 json_output,
             );
             Ok(())
@@ -231,6 +267,27 @@ async fn run(cli: Cli, json_output: bool) -> Result<()> {
         }
         command => {
             let operation = match command {
+                Commands::PreviewEmail { input } => Operation::PreviewEmail {
+                    email: email_input(&input)?,
+                },
+                Commands::CreateDraft {
+                    input,
+                    signature_draft_id,
+                } => Operation::CreateDraft {
+                    email: email_input(&input)?,
+                    signature_draft_id,
+                },
+                Commands::UpdateDraft {
+                    input,
+                    signature_draft_id,
+                    id,
+                    change_key,
+                } => Operation::UpdateDraft {
+                    email: email_input(&input)?,
+                    signature_draft_id,
+                    id,
+                    change_key,
+                },
                 Commands::Login => {
                     eprintln!(
                         "Complete Microsoft sign-in/MFA in the Glaux browser window. Session state stays in the dedicated profile."
@@ -258,6 +315,32 @@ async fn run(cli: Cli, json_output: bool) -> Result<()> {
     }
 }
 
+fn email_input(path: &std::path::Path) -> Result<glaux::compose::EmailInput> {
+    use std::io::Read;
+    let reader: Box<dyn Read> = if path == std::path::Path::new("-") {
+        Box::new(std::io::stdin())
+    } else {
+        Box::new(
+            std::fs::File::open(path)
+                .map_err(|_| anyhow::anyhow!("Cannot open email input file"))?,
+        )
+    };
+    let mut bytes = Vec::new();
+    reader
+        .take(2 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("Cannot read email input"))?;
+    anyhow::ensure!(
+        bytes.len() <= 2 * 1024 * 1024,
+        "Email JSON input exceeds 2 MiB"
+    );
+    serde_json::from_slice(&bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "Invalid email JSON: expected to/cc/bcc arrays, subject and html; see docs/composing.md"
+        )
+    })
+}
+
 fn output(value: &Value, json_output: bool) {
     if json_output {
         println!("{}", json!({"ok":true,"schema_version":1,"data":value}));
@@ -271,7 +354,7 @@ fn output(value: &Value, json_output: bool) {
         if messages.is_empty() {
             println!("No messages.");
         }
-    } else if value.get("id").is_some() {
+    } else if value.get("id").is_some() && value.get("saved").is_none() {
         print_mail(value, true);
     } else {
         println!(

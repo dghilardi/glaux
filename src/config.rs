@@ -22,6 +22,25 @@ pub enum BrowserPlatform {
     Wayland,
 }
 
+/// A process-level capability, never supplied by an MCP tool call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum MailWritePolicy {
+    #[default]
+    ReadOnly,
+    Drafts,
+}
+
+impl MailWritePolicy {
+    pub fn require_drafts(self) -> Result<()> {
+        if self != Self::Drafts {
+            bail!(
+                "mail_writes_disabled: enable --mail-write-policy drafts (GLAUX_MAIL_WRITE_POLICY) to save drafts"
+            );
+        }
+        Ok(())
+    }
+}
+
 pub fn trusted_url(raw: &str) -> Result<Url> {
     let url = Url::parse(raw).context("Invalid Outlook URL")?;
     if url.scheme() != "https"
@@ -47,6 +66,7 @@ pub struct Config {
     pub browser_platform: BrowserPlatform,
     /// Enables unattended passkey sign-in for this account; see `login.rs`.
     pub passkey_account: Option<String>,
+    pub mail_write_policy: MailWritePolicy,
 }
 
 impl Config {
@@ -70,6 +90,7 @@ impl Config {
             timeout_secs,
             browser_platform: BrowserPlatform::Auto,
             passkey_account: None,
+            mail_write_policy: MailWritePolicy::ReadOnly,
         })
     }
     pub fn profile(&self) -> PathBuf {

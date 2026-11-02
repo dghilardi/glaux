@@ -72,8 +72,19 @@ async fn mcp_stdio_discovery_and_errors_without_opening_browser() {
         stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n").await.unwrap();
         let response: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         assert!(tools.iter().all(|tool| tool["annotations"]["readOnlyHint"] == true));
+        assert!(!dir.path().join("browser-profile").exists());
+        let preview = json!({"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"preview_email","arguments":{"to":["reader@example.test"],"subject":"Synthetic","html":"<p>Caffè &amp; attività</p>"}}});
+        stdin.write_all(format!("{preview}\n").as_bytes()).await.unwrap();
+        let response: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+        assert_ne!(response["result"]["isError"], true);
+        let payload: Value = serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(payload["data"]["email"]["text"].as_str().unwrap().contains("Caffè & attività"));
+        let disabled = json!({"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"create_draft","arguments":{"email":{"subject":"Synthetic","html":"<p>Body</p>"},"signature_draft_id":"fixture"}}});
+        stdin.write_all(format!("{disabled}\n").as_bytes()).await.unwrap();
+        let response: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(response.get("error").is_some() || response["result"]["isError"] == true);
         assert!(!dir.path().join("browser-profile").exists());
 
         let invalid_call = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_messages","arguments":{"limit":1000}}});
@@ -89,6 +100,114 @@ async fn mcp_stdio_discovery_and_errors_without_opening_browser() {
             let signal = Command::new("kill").args(["-TERM", &child.id().unwrap().to_string()]).status().await.unwrap();
             assert!(signal.success());
         }
+        drop(stdin);
+        child.wait().await.unwrap();
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn composition_and_draft_policy_are_checked_before_browser_startup() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("email.json");
+    std::fs::write(
+        &input,
+        r#"{"to":["reader@example.test"],"subject":"Synthetic","html":"<p>Local preview</p>"}"#,
+    )
+    .unwrap();
+    let data = directory.path().join("unused");
+    let output = Command::new(env!("CARGO_BIN_EXE_glaux"))
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["--browser", "/bin/false", "preview-email", "--input"])
+        .arg(&input)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["data"]["signature"], "not_applied");
+    assert!(!data.exists());
+    let output = Command::new(env!("CARGO_BIN_EXE_glaux"))
+        .arg("--data-dir")
+        .arg(&data)
+        .args([
+            "--browser",
+            "/bin/false",
+            "create-draft",
+            "--signature-draft-id",
+            "fixture",
+            "--input",
+        ])
+        .arg(&input)
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mail_writes_disabled"));
+    assert!(!data.exists());
+    std::fs::write(
+        &input,
+        r#"{"subject":"Synthetic","html":"<p onclick='secret'>Body</p>"}"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_glaux"))
+        .arg("--data-dir")
+        .arg(&data)
+        .args([
+            "--browser",
+            "/bin/false",
+            "--mail-write-policy",
+            "drafts",
+            "create-draft",
+            "--signature-draft-id",
+            "fixture",
+            "--input",
+        ])
+        .arg(&input)
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("secret"));
+    assert!(!data.exists());
+}
+
+#[tokio::test]
+async fn mcp_draft_tools_require_the_process_policy_and_reject_invalid_input_locally() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("unused");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_glaux"))
+            .arg("--data-dir").arg(&data).args(["--browser", "/bin/false", "--mail-write-policy", "drafts", "mcp"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+        for request in [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"synthetic","version":"1"}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        ] {
+            stdin.write_all(format!("{request}\n").as_bytes()).await.unwrap();
+            if request.get("id").is_some() {
+                let response: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+                if request["id"] == 2 {
+                    let tools = response["result"]["tools"].as_array().unwrap();
+                    assert_eq!(tools.len(), 5);
+                    for name in ["create_draft", "update_draft"] {
+                        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+                        assert_eq!(tool["annotations"]["readOnlyHint"], false);
+                        assert_eq!(tool["annotations"]["idempotentHint"], false);
+                    }
+                    assert!(tools.iter().all(|tool| tool["name"] != "send_draft"));
+                }
+            }
+        }
+        let invalid = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_draft","arguments":{"signature_draft_id":"fixture","email":{"subject":"Synthetic","html":"<script>secret</script>"}}}});
+        stdin.write_all(format!("{invalid}\n").as_bytes()).await.unwrap();
+        let response: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(!response.to_string().contains("secret"));
+        assert!(!data.exists());
         drop(stdin);
         child.wait().await.unwrap();
     }).await.unwrap();
