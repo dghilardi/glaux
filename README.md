@@ -84,7 +84,7 @@ Allowed Outlook hosts are `outlook.office.com`, `outlook.office365.com` and `out
 
 ## MCP
 
-Glaux exposes three read-only tools over stdio with the official Rust SDK: `list_messages` (`folder`, `limit`, `offset`), `read_message` (`id`) and `preview_email` (local semantic HTML validation and derived text). Opting in to `--mail-write-policy drafts` also exposes `create_draft` and `update_draft`, using a signature-only Outlook draft as a template; see [composition and configuration](docs/composing.md). It does not expose sign-in, sending, scripts or arbitrary requests. Run `glaux login` before mailbox access, then configure your client:
+Glaux exposes three read-only tools over stdio with the official Rust SDK: `list_messages` (`folder`, `limit`, `offset`), `read_message` (`id`) and `preview_email` (local semantic HTML validation, MJML/MRML presentation and derived text). Opting in to `--mail-write-policy drafts` also exposes `create_draft` and `update_draft`, using a signature-only Outlook draft as a template; see [composition and configuration](docs/composing.md). It does not expose sign-in, sending, scripts or arbitrary requests. Run `glaux login` before mailbox access, then configure your client:
 
 ```json
 {
