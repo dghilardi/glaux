@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
-- Controlled inline email presentation shared by previews and drafts, with a configurable high-contrast accent, readable typography and preserved data tables; signature formatting remains separate.
+- Controlled inline email presentation shared by previews and drafts, with a configurable high-contrast accent, readable typography and preserved data tables; signature formatting remains separate. Recipient-free live OWA creation and content readback passed on one session; visual and broader client validation remain pending.
 
 ### Changed
 

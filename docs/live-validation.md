@@ -97,9 +97,11 @@ The template used external HTTPS images, so live CID image preservation remains 
 
 The inline renderer is covered by synthetic composition, MIME readback and CLI/MCP tests. A native Chromium fixture checks 375, 600 and 1024 px viewports without external resources. These checks do not establish live tenant or mail-client rendering compatibility.
 
+On 2026-11-02, branch commit `642159e` was exercised against one real OWA session through a temporary daemon executable, then the installed 0.5.0 daemon was restored and confirmed active. One recipient-free draft with synthetic body text was created through MCP and returned `saved: true`, `verified: true`, `is_draft: true`. Subsequent read-only MIME checks confirmed empty recipient headers, no ordinary attachments, retained renderer width/font styles, matching signature text/links/image references and matching inline image bytes. The initial validation runner did not complete its strict template byte-identity check; template byte identity across the write is not established by this run. No template update or send operation was issued. Visual owner confirmation and other clients remain pending.
+
 Before declaring the new presentation validated for a deployment:
 
-- [ ] Create a recipient-free test draft with the rendered body and an existing signature-only template; confirm saved MIME verification.
+- [x] Create a recipient-free test draft with the rendered body and an existing signature-only template; confirm saved MIME verification.
 - [ ] Inspect headings, links, a small data table and wrapped long text in OWA.
 - [ ] Confirm signature formatting and logo remain intact and the template remains unchanged.
 - [ ] Inspect target desktop and mobile mail clients, including dark mode; record the exact clients checked. Do not infer support from Chromium screenshots.
