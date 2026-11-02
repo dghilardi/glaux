@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
-- Controlled email presentation shared by previews and drafts through a local MJML/MRML layout, with a configurable high-contrast accent, Outlook compatibility markup and preserved data tables. Signature templates remain strict; saved MIME recognizes only the fixed renderer’s head rules and comments. Verification status and limits are recorded in the live-validation checklist.
+- Controlled email presentation shared by previews and drafts through a local MJML/MRML layout, with a configurable high-contrast accent, Outlook compatibility markup, a signature in the same layout column and preserved data tables. Signature templates remain strict; saved MIME recognizes only the fixed renderer’s head rules and comments. Verification status and limits are recorded in the live-validation checklist.
 
 ### Changed
 

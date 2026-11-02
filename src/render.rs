@@ -4,11 +4,13 @@ use anyhow::{Result, ensure};
 use scraper::{Html, Node};
 use std::sync::OnceLock;
 
+pub(crate) const SIGNATURE_SLOT: &str = "<!--glaux-signature-slot-->";
+
 fn document(content: &str) -> Result<String> {
     // Only validated HTML enters mj-text. Includes, remote loaders and arbitrary MJML
     // are not exposed, and MRML is compiled without filesystem or HTTP loaders.
     let source = format!(
-        r##"<mjml><mj-body width="640px" background-color="#ffffff"><mj-section padding="0" text-align="left"><mj-column width="100%" padding="0"><mj-text font-family="Arial,Helvetica,sans-serif" font-size="16px" line-height="1.5" color="#202124" padding="0" align="left">{content}</mj-text></mj-column></mj-section></mj-body></mjml>"##
+        r##"<mjml><mj-body width="640px" background-color="#ffffff"><mj-section padding="0 16px" text-align="left"><mj-column width="100%" padding="0"><mj-text font-family="Arial,Helvetica,sans-serif" font-size="16px" line-height="1.5" color="#202124" padding="0" align="left">{content}</mj-text><mj-raw>{SIGNATURE_SLOT}</mj-raw></mj-column></mj-section></mj-body></mjml>"##
     );
     let root = mrml::parse(&source).map_err(|_| anyhow::anyhow!("email_render_failed"))?;
     root.element

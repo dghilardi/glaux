@@ -79,11 +79,19 @@ impl Signature {
     }
 
     pub fn mime(&self, email: &PreparedEmail) -> Result<Vec<u8>> {
-        let body = email
-            .html
-            .strip_suffix("</body></html>")
-            .ok_or_else(|| anyhow::anyhow!("invalid_rendered_document"))?;
-        let html = format!("{body}<div>{}</div></body></html>", self.html);
+        let slot = crate::render::SIGNATURE_SLOT;
+        ensure!(
+            email.html.ends_with("</body></html>") && email.html.matches(slot).count() == 1,
+            "invalid_rendered_document"
+        );
+        // Keep the signature in the same width-constrained column, outside authored
+        // content styling. Explicit defaults prevent the layout's zero font-size
+        // from hiding signature text that has no font-size of its own.
+        let signature = format!(
+            "<tr><td align=\"left\" style=\"padding:0;font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.5;color:#202124;\"><div>{}</div></td></tr>",
+            self.html
+        );
+        let html = email.html.replacen(slot, &signature, 1);
         ensure!(html.len() <= MAX_HTML_BYTES, "composed_html_too_large");
         let mut checked = Html::parse_document(&html);
         inline_outlook_paragraph_reset(&mut checked, true)?;
@@ -607,6 +615,13 @@ pub(crate) mod tests {
         verify_saved(&mime, &mime).unwrap();
         let saved = Signature::from_saved(&mime).unwrap();
         assert!(saved.html.contains("max-width:640px"));
+        assert!(!saved.html.contains(crate::render::SIGNATURE_SLOT));
+        let document = Html::parse_document(&saved.html);
+        let layout = document
+            .select(&Selector::parse("div[style*=\"max-width:640px\"]").unwrap())
+            .next()
+            .unwrap();
+        assert!(layout.text().collect::<String>().contains("Signature"));
         assert!(saved.html.contains("font-family:Arial;color:rgb(1, 2, 3)"));
         signature.check_existing_images(&mime).unwrap();
     }
