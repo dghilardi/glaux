@@ -141,3 +141,11 @@ The temporary branch daemon created one recipient-free MRML draft using an exist
 The final submitted HTML has SHA-256 `936adddfe287fb9916f864b2e77142d27f43c35a38e06f056fe45a39ee4e7aa9`.
 
 The external service renders submitted synthetic HTML directly; it does not certify every transformation of an OWA-saved draft or every client/theme/table/signature combination. CID images remain covered by synthetic MIME fixtures, not this external logo test.
+
+### Local theme configuration validation, 2026-11-03
+
+Branch commit `e7d27c1` was exercised on Linux against one existing live OWA session using a temporary branch daemon. A persistent MCP client loaded the palette from the local data-directory `email-theme.toml`, without theme fields in the email request. The offline preview contained the configured text, border and decorative colors. Through the shared service, creation and an update of the same recipient-free draft both returned `saved: true`, `verified: true`, `is_draft: true`; a subsequent plain-text read confirmed the update. Native saved-MIME checks compared the recipient-free input, content, signature and images. The signature template's MIME remained byte-identical across both writes, and the temporary daemon PID stayed unchanged during the client calls. No send or template-update operation was issued.
+
+The installed 0.6.0 service was restored and confirmed active after the test. The palette remains in local configuration only; no organization-specific colors, names or assets were added to the repository. `just check` passed with 69 Rust unit tests, 12 CLI/MCP/service integration tests and seven Python tests; all eight native Chromium fixtures passed, including responsive layout and shared-service draft writes using synthetic themes.
+
+This establishes one live create/update and content-consistency run, not visual certification of the configured palette in Outlook or other mail clients. No new manual Outlook appearance confirmation or external cross-client screenshot run was performed for these theme options. Previously recorded rendering evidence remains limited to the samples and versions identified above.
