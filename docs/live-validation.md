@@ -92,3 +92,16 @@ Record only date, platform/browser/host and aggregate outcomes: create, update, 
 On Linux with Chromium 155.0.8059.84, one existing Microsoft 365 session passed CLI list/read/status reuse and MCP read-only discovery/list/read. The explicit draft-policy MCP invocation exposed five tools and no send tool. Creating one recipient-free test draft and updating the same item both returned `saved: true`, `is_draft: true` and `verified: true`. The stored MIME passed the HTML/text consistency check. The signature template's exported MIME remained byte-for-byte unchanged; stale ChangeKeys and attempts to update the template were rejected. The account owner confirmed the signature, logo, links and formatting looked correct in Outlook. The daemon was restored after each validation invocation.
 
 The template used external HTTPS images, so live CID image preservation remains untested. Live recipient fields (including Bcc MIME behavior), server-side concurrent edits, sent/addressed/extra-attachment rejection, and persistence after a reboot or 24 hours remain pending. Server-side conflicts, CID images, attachment guards and uncertain saves are covered by synthetic loopback tests. This records one tenant/session only and does not establish broader support.
+
+## Controlled email renderer validation
+
+The inline renderer is covered by synthetic composition, MIME readback and CLI/MCP tests. A native Chromium fixture checks 375, 600 and 1024 px viewports without external resources. These checks do not establish live tenant or mail-client rendering compatibility.
+
+Before declaring the new presentation validated for a deployment:
+
+- [ ] Create a recipient-free test draft with the rendered body and an existing signature-only template; confirm saved MIME verification.
+- [ ] Inspect headings, links, a small data table and wrapped long text in OWA.
+- [ ] Confirm signature formatting and logo remain intact and the template remains unchanged.
+- [ ] Inspect target desktop and mobile mail clients, including dark mode; record the exact clients checked. Do not infer support from Chromium screenshots.
+
+Use synthetic body text for this validation and never record mailbox identifiers, addresses or message contents in this checklist. Sending mail requires separate explicit authorization.

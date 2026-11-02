@@ -75,12 +75,14 @@ async fn mcp_stdio_discovery_and_errors_without_opening_browser() {
         assert_eq!(tools.len(), 3);
         assert!(tools.iter().all(|tool| tool["annotations"]["readOnlyHint"] == true));
         assert!(!dir.path().join("browser-profile").exists());
-        let preview = json!({"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"preview_email","arguments":{"to":["reader@example.test"],"subject":"Synthetic","html":"<p>Caffè &amp; attività</p>"}}});
+        let preview = json!({"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"preview_email","arguments":{"to":["reader@example.test"],"subject":"Synthetic","html":"<p>Caffè &amp; attività</p><p><a href=\"https://example.test\">Report</a></p>","theme":{"accent":"#123456"}}}});
         stdin.write_all(format!("{preview}\n").as_bytes()).await.unwrap();
         let response: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
         assert_ne!(response["result"]["isError"], true);
         let payload: Value = serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert!(payload["data"]["email"]["text"].as_str().unwrap().contains("Caffè & attività"));
+        let email = serde_json::from_value(preview["params"]["arguments"].clone()).unwrap();
+        assert_eq!(payload["data"]["email"]["html"], glaux::compose::prepare(&email).unwrap().html);
         let disabled = json!({"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"create_draft","arguments":{"email":{"subject":"Synthetic","html":"<p>Body</p>"},"signature_draft_id":"fixture"}}});
         stdin.write_all(format!("{disabled}\n").as_bytes()).await.unwrap();
         let response: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
@@ -169,6 +171,32 @@ async fn composition_and_draft_policy_are_checked_before_browser_startup() {
         .unwrap();
     assert!(!output.status.success());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("secret"));
+    assert!(!data.exists());
+    std::fs::write(
+        &input,
+        json!({"subject":"Synthetic","html":"<p>Body</p>","theme":{"accent":"#ffffff"}})
+            .to_string(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_glaux"))
+        .arg("--data-dir")
+        .arg(&data)
+        .args([
+            "--browser",
+            "/bin/false",
+            "--mail-write-policy",
+            "drafts",
+            "create-draft",
+            "--signature-draft-id",
+            "fixture",
+            "--input",
+        ])
+        .arg(&input)
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid_theme_accent"));
     assert!(!data.exists());
 }
 

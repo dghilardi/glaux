@@ -9,6 +9,7 @@ pub mod guard;
 pub mod login;
 pub mod mcp;
 pub mod owa;
+mod render;
 pub mod reprocess;
 pub mod retention;
 pub mod service;
@@ -61,7 +62,7 @@ pub(crate) fn validate_operation(
     match operation {
         Operation::PreviewEmail { email } => {
             return Ok(Some(
-                json!({"email":compose::prepare(email)?,"signature":"not_applied","warnings":["Local preview excludes the Outlook template signature and images; these are included when saving a draft."]}),
+                json!({"email":compose::prepare(email)?,"signature":"not_applied","warnings":["Local preview excludes the Outlook template signature and images; these are included when saving a draft.","Inline presentation does not guarantee identical rendering or dark-mode colors across mail clients. Wide tables retain their structure; prefer sections or lists on small screens."]}),
             ));
         }
         Operation::CreateDraft {

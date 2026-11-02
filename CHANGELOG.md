@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Controlled inline email presentation shared by previews and drafts, with a configurable high-contrast accent, readable typography and preserved data tables; signature formatting remains separate.
+
 ### Changed
 
 - Document successful live read-only validation of the shared mailbox service on Linux, including concurrent CLI/MCP clients.

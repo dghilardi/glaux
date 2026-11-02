@@ -14,6 +14,9 @@ use tokio::{
 #[path = "support/draft_owa.rs"]
 mod draft_owa;
 
+#[path = "support/email_layout.rs"]
+mod email_layout;
+
 async fn navigate(browser: &mut Browser, url: &str) {
     browser
         .cdp

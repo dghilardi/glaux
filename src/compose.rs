@@ -22,6 +22,24 @@ pub struct EmailInput {
     /// Semantic HTML fragment (p, headings, lists, links, tables, emphasis). No CSS or images.
     /// Plain text is derived automatically. Maximum 256 KiB.
     pub html: String,
+    /// Controlled presentation options; omitted values use the neutral default theme.
+    #[serde(default)]
+    pub theme: EmailTheme,
+}
+
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmailTheme {
+    /// Link and heading color, in #RRGGBB format. Must contrast with white by at least 4.5:1.
+    pub accent: String,
+}
+
+impl Default for EmailTheme {
+    fn default() -> Self {
+        Self {
+            accent: "#24527a".into(),
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -160,7 +178,8 @@ pub fn prepare(input: &EmailInput) -> Result<PreparedEmail> {
             _ => {}
         }
     }
-    let html = fragment.root_element().inner_html();
+    let html = crate::render::render(fragment, &input.theme)?;
+    ensure!(html.len() <= MAX_HTML_BYTES, "rendered_html_too_large");
     let text = plain_text(&html)?;
     ensure!(
         !text.trim().is_empty(),
@@ -201,7 +220,7 @@ pub(crate) fn validate_link(value: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     pub fn input(html: &str) -> EmailInput {
         EmailInput {
@@ -210,6 +229,7 @@ mod tests {
             bcc: vec![],
             subject: "Synthetic subject".into(),
             html: html.into(),
+            theme: EmailTheme::default(),
         }
     }
 

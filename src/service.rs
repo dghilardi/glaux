@@ -515,6 +515,7 @@ mod local {
         fn draft() -> Operation {
             Operation::CreateDraft {
                 email: crate::compose::EmailInput {
+                    theme: Default::default(),
                     to: vec![],
                     cc: vec![],
                     bcc: vec![],

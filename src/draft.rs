@@ -74,6 +74,8 @@ impl Signature {
             "<html><body><div>{}</div><div>{}</div></body></html>",
             email.html, self.html
         );
+        ensure!(html.len() <= MAX_HTML_BYTES, "composed_html_too_large");
+        validate_signature(&Html::parse_document(&html), &self.images)?;
         let text = plain_text(&html)?;
         let digest = format!("{:x}", Sha256::digest(html.as_bytes()));
         // RFC 2046 limits boundary values to 70 characters, including our prefix.
@@ -501,7 +503,8 @@ fn validate_style(style: &str) -> Result<()> {
                 "min-width",
                 "min-height",
                 "display",
-                "white-space"
+                "white-space",
+                "overflow-wrap"
             ]
             .contains(&property.as_str())
                 && !["url", "expression", "var(", "attr("]
@@ -521,12 +524,57 @@ pub(crate) mod tests {
     use super::*;
     use crate::compose::{EmailInput, prepare};
 
+    #[test]
+    fn rendered_body_roundtrips_without_restyling_signature() {
+        let mut input = crate::compose::tests::input(
+            "<h2>Update</h2><p><a href=\"https://example.test/report\">Report</a></p><table><tr><th scope=\"col\">Task</th><th>State</th></tr><tr><td>One</td><td>Ready</td></tr></table><blockquote>Note</blockquote><pre>code</pre><hr>",
+        );
+        input.theme.accent = "#123456".into();
+        let prepared = prepare(&input).unwrap();
+        let signature = Signature::from_mime(TEMPLATE).unwrap();
+        let mime = signature.mime(&prepared).unwrap();
+        verify_saved(&mime, &mime).unwrap();
+        let saved = Signature::from_mime(&mime).unwrap();
+        assert!(saved.html.contains(&prepared.html));
+        assert!(saved.html.contains("font-family:Arial;color:rgb(1, 2, 3)"));
+        signature.check_existing_images(&mime).unwrap();
+    }
+
+    #[test]
+    fn refuses_oversized_or_too_deep_composed_html_before_saving() {
+        let template = String::from_utf8(TEMPLATE.to_vec())
+            .unwrap()
+            .replace("Signature", &"s".repeat(100_000));
+        let signature = Signature::from_mime(template.as_bytes()).unwrap();
+        let input = crate::compose::tests::input(&format!("<p>{}</p>", "x".repeat(200_000)));
+        assert_eq!(
+            signature
+                .mime(&prepare(&input).unwrap())
+                .err()
+                .unwrap()
+                .to_string(),
+            "composed_html_too_large"
+        );
+        let input = crate::compose::tests::input(&format!(
+            "{}text{}",
+            "<div>".repeat(60),
+            "</div>".repeat(60)
+        ));
+        assert!(
+            Signature::from_mime(TEMPLATE)
+                .unwrap()
+                .mime(&prepare(&input).unwrap())
+                .is_err()
+        );
+    }
+
     pub(crate) const TEMPLATE: &[u8] = b"From: owner@example.test\r\nDate: Mon, 2 Nov 2026 10:00:00 +0000\r\nContent-Type: multipart/related; boundary=fixture\r\n\r\n--fixture\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><div style=\"font-family:Arial;color:rgb(1, 2, 3)\">Signature<img src=\"cid:logo@example.test\" alt=\"Logo\"></div></body></html>\r\n--fixture\r\nContent-Type: image/png\r\nContent-ID: <logo@example.test>\r\nContent-Transfer-Encoding: base64\r\n\r\nc3ludGhldGljLWltYWdl\r\n--fixture--\r\n";
 
     #[test]
     fn builds_alternatives_from_final_html_and_preserves_signature_images() {
         let signature = Signature::from_mime(TEMPLATE).unwrap();
         let input = EmailInput {
+            theme: Default::default(),
             to: vec!["reader@example.test".into()],
             cc: vec![],
             bcc: vec![],
@@ -624,6 +672,7 @@ pub(crate) mod tests {
         assert!(signature.html.contains("Aptos_EmbeddedFont"));
         assert!(signature.html.contains("target=\"_blank\""));
         let email = prepare(&EmailInput {
+            theme: Default::default(),
             to: vec![],
             cc: vec![],
             bcc: vec![],

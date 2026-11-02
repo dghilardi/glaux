@@ -240,6 +240,7 @@ async fn draft_writes_preserve_templates_reject_conflicts_and_never_retry() {
             headers: HashMap::new(),
         });
         let email = EmailInput {
+            theme: Default::default(),
             to: vec!["reader@example.test".into()],
             cc: vec!["copy@example.test".into()],
             bcc: vec!["blind@example.test".into()],
@@ -432,11 +433,16 @@ async fn socket_clients_and_archive_work_share_the_owned_browser() {
         });
         let output = directory.path().join("client-export.eml");
         let email = EmailInput {
+            theme: glaux::compose::EmailTheme {
+                accent: "#123456".into(),
+            },
             to: vec![],
             cc: vec![],
             bcc: vec![],
             subject: "Synthetic socket draft".into(),
-            html: "<p>Shared session</p>".into(),
+            html:
+                "<h2>Shared session</h2><p><a href=\"https://example.test/report\">Report</a></p>"
+                    .into(),
         };
         let (read, draft, export) = tokio::join!(
             glaux::execute(
