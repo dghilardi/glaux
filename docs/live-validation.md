@@ -49,7 +49,7 @@ Restart the service even if the check fails, then inspect the `reason` in `archi
 
 ## MCP
 
-After signing in from the terminal, connect `glaux mcp` to a local client. Check discovery of the two tools, a short listing and reading a selected ID. The client receives the content it reads.
+After signing in from the terminal, connect `glaux mcp` with the default read-only policy to a local client. Check discovery of `list_messages`, `read_message` and `preview_email`, a short listing and reading a selected ID. Check a local preview without browser activity. Draft tools must be absent. The client receives the content it reads.
 
 ## Repeatable check without printing mail
 
@@ -59,10 +59,30 @@ From the repository root, after `glaux login`, with Python 3.11 or newer:
 python3 scripts/validate_live.py --glaux /absolute/path/to/glaux
 ```
 
-The script lists five inbox messages and reads the first one in separate CLI processes, then checks `status`. It starts a real MCP stdio server, negotiates the protocol, discovers the two tools, calls `list_messages` and `read_message` and compares the message with the CLI result. The inbox must contain at least one message. IDs and content stay in memory; the script prints only the outcome and saves no fixtures or logs. A message changing between the two reads can make the comparison fail: just repeat.
+The script lists five inbox messages and reads the first one in separate CLI processes, then checks `status`. It starts a real MCP stdio server, negotiates the protocol, discovers the three read-only tools, calls `list_messages` and `read_message` and compares the message with the CLI result. It does not test draft writes. The inbox must contain at least one message. IDs and content stay in memory; the script prints only the outcome and saves no fixtures or logs. A message changing between the two reads can make the comparison fail: just repeat. Use the default policy without `GLAUX_MAIL_WRITE_POLICY=drafts` for this read-only script.
 
 Use `--data-dir` if you signed in with a non-default directory; other `GLAUX_*` variables are inherited. The script accesses a real mailbox and is not part of `cargo test`. Signal-based cleanup is verified on Linux only.
 
 ## What to record
 
 Date, operating system, browser version, OWA host and the outcome of login, list, read, MCP and session reuse after 24 hours and after a reboot. Never record tokens, cookies, message IDs, subjects or addresses.
+
+## Drafts: opt-in manual validation
+
+This checklist is **partially validated**; the full checklist remains incomplete. Synthetic loopback tests do not demonstrate OWA write compatibility on any live tenant. Run these checks only with the account owner's authorization to create and update test drafts. Do not enable sending or change installed services as part of validation.
+
+1. Prepare a signature-only HTML draft in Outlook as described in [composition](composing.md). Include a Unicode signature, a link and a CID logo if applicable; leave all recipients empty. Wait for Outlook to save it. Keep its ID private and do not paste the content into issues.
+2. Confirm default MCP discovery contains only the three read-only tools. A valid local preview must work without starting Chromium; invalid HTML/addresses must fail locally, including when the draft policy is enabled.
+3. Configure a separate test invocation with `--mail-write-policy drafts`. Confirm five tools are exposed and no send tool exists. Create one draft from synthetic authored content and the template. Verify it appears only as an unsent draft; no sent item, move or read-state change is caused by Glaux.
+4. Check subject, To/Cc/Bcc, Unicode, semantic formatting, links, signature styling and inline logo in Outlook. Confirm the template is unchanged. Inspect both stored MIME alternatives privately; verify `verified: true` corresponds to the actual saved content. A `verified: false` result must retain its saved ID and warn for manual review. Do not publish the MIME or message data.
+5. Update the created draft with its current ChangeKey and confirm the same draft changes without a second signature or lost inline images. Change it in Outlook and verify a stale ChangeKey is rejected. Check server-side conflict rejection, not only the client's pre-read.
+6. Verify the template cannot be updated through `update_draft`, a sent message is rejected, an addressed template is rejected, and drafts with additional attachments are refused without changes.
+7. If a save is unconfirmed, inspect Drafts yourself before any retry. Use loopback tests, not a real mailbox, to inject network/authentication failures. Confirm normal shutdown leaves the dedicated profile reusable.
+
+Record only date, platform/browser/host and aggregate outcomes: create, update, conflicts, signature, CID image, HTML/text preservation and template immutability. In particular, verify the tenant accepts these internal OWA MIME write payloads; EWS documentation is not proof. Broader tenant/platform support remains unverified until separately checked.
+
+### Recorded validation, 2026-11-02
+
+On Linux with Chromium 155.0.8059.84, one existing Microsoft 365 session passed CLI list/read/status reuse and MCP read-only discovery/list/read. The explicit draft-policy MCP invocation exposed five tools and no send tool. Creating one recipient-free test draft and updating the same item both returned `saved: true`, `is_draft: true` and `verified: true`. The stored MIME passed the HTML/text consistency check. The signature template's exported MIME remained byte-for-byte unchanged; stale ChangeKeys and attempts to update the template were rejected. The account owner confirmed the signature, logo, links and formatting looked correct in Outlook. The daemon was restored after each validation invocation.
+
+The template used external HTTPS images, so live CID image preservation remains untested. Live recipient fields (including Bcc MIME behavior), server-side concurrent edits, sent/addressed/extra-attachment rejection, and persistence after a reboot or 24 hours remain pending. Server-side conflicts, CID images, attachment guards and uncertain saves are covered by synthetic loopback tests. This records one tenant/session only and does not establish broader support.

@@ -120,7 +120,7 @@ async def validate(command):
                 "MCP selected an unsupported protocol version")
         await send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         tools = (await request(2, "tools/list"))["tools"]
-        require({t["name"] for t in tools} == {"list_messages", "read_message"},
+        require({t["name"] for t in tools} == {"list_messages", "read_message", "preview_email"},
                 "Unexpected MCP discovery result")
         require(all(t.get("annotations", {}).get("readOnlyHint") for t in tools),
                 "Missing read-only annotations")

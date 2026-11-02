@@ -8,7 +8,9 @@ A single Rust package provides the `glaux` library and binary. The CLI and the M
 - `browser.rs`: isolated browser launch, CDP target selection, navigation and clean shutdown.
 - `shutdown.rs`: SIGINT/SIGTERM registration before the browser starts (Unix).
 - `cdp.rs`: sequential CDP websocket, response correlation and observation of OWA request headers. A context is accepted only from a successful response on the exact `/owa/service.svc` path; `requestWillBeSentExtraInfo` may arrive before or after the request and response.
-- `owa.rs`: `FindItem`/`GetItem` payloads, in-page fetch transport and response normalization.
+- `owa.rs`: `FindItem`/`GetItem` payloads, opt-in `SaveOnly` draft writes, in-page fetch transport and response normalization.
+- `compose.rs`: local semantic HTML and recipient validation, normalization and plain-text derivation.
+- `draft.rs`: validated Outlook signature templates, related inline images, multipart alternatives and saved-MIME consistency checks.
 - `export.rs`: atomic, non-overwriting publication of private EML files; the MIME comes from the server.
 - `archive.rs`: local classification rules, archive integrity, SQLite state, backfill cursor, explicit per-item exclusions, opt-in retention and polling with backoff.
 - `retention.rs`: retention periods and parsing of OWA receive times.
@@ -17,7 +19,7 @@ A single Rust package provides the `glaux` library and binary. The CLI and the M
 - `guard.rs`: starts and stops a systemd authenticator unit based on the `loginctl` session state.
 - `lib.rs`: input validation, authentication, the operation itself and cleanup on errors or Ctrl-C.
 - `main.rs`: CLI, human/JSON output and diagnostics.
-- `mcp.rs`: two read-only stdio tools with serialized calls.
+- `mcp.rs`: three read-only stdio tools plus two draft tools exposed only under the process draft-write policy; calls are serialized.
 
 ## Lifecycle of a read
 
@@ -31,6 +33,10 @@ A single Rust package provides the `glaux` library and binary. The CLI and the M
 8. Close Chromium cleanly so cookies and storage are flushed, then release the lock.
 
 HTTP 401/440 allows one renewal attempt by navigating to Outlook again. HTTP 403 is reported without retry loops, HTTP 429 is not retried automatically. Allowed operations are fixed in code and never derived from assistant input.
+
+The renewal retry applies to reads only. Draft writes are never retried. With `--mail-write-policy drafts`, creation uses `CreateItem`/`SaveOnly` in Drafts; updates require a current `IsDraft` and `ChangeKey`, with `UpdateItem`/`SaveOnly`/`NeverOverwrite`. Transport checks reject send dispositions and other mutation actions. The signature-only Outlook template is read with MIME and never modified. Unsupported signature markup or attachments stop the operation before a write. Authored HTML and signature become one HTML body, from which plain text is derived; CID images are copied into related MIME parts. A readback checks the saved content; failure to verify is reported separately from a successful save. Neither readback nor loopback fixtures establish live tenant support. See [composition](composing.md).
+
+`preview_email` returns before profile locking or browser launch and excludes the online signature. The draft policy defaults to read-only and is supplied by CLI/environment configuration, never by tool parameters.
 
 ## Deliberate limits
 

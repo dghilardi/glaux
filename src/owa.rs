@@ -1,5 +1,10 @@
 //! OWA's internal JSON protocol, not EWS SOAP or Graph. Payloads are isolated here.
-use crate::{browser::Browser, config::Config};
+use crate::{
+    browser::Browser,
+    compose::{EmailInput, prepare},
+    config::Config,
+    draft::Signature,
+};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
@@ -33,6 +38,10 @@ pub struct MailAddress {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mail {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_draft: Option<bool>,
     pub subject: String,
     pub from: Option<MailAddress>,
     pub received_at: Option<String>,
@@ -163,17 +172,15 @@ pub fn validate_mime(bytes: &[u8]) -> Result<()> {
 }
 
 /// Never exposes a general-purpose action, arbitrary URL or JavaScript through MCP.
-async fn fetch(browser: &mut Browser, action: &str, body: Value) -> Result<Value> {
-    if !["FindItem", "GetItem"].contains(&action) {
-        bail!("Unsupported read-only action");
-    }
+async fn fetch(browser: &mut Browser, config: &Config, action: &str, body: Value) -> Result<Value> {
+    validate_action(config, action, &body)?;
     let context = browser
         .cdp
         .context
         .as_ref()
         .context("No authenticated OWA session")?
         .clone();
-    // Use our typed read-only envelope. Unrelated bootstrap requests may carry
+    // Use our typed envelope. Unrelated bootstrap requests may carry
     // differently shaped/null metadata and must not overwrite its version or UTC zone.
     let mut headers = context.headers;
     headers.insert(
@@ -218,11 +225,13 @@ async fn request(
     action: &str,
     body: Value,
 ) -> Result<Value> {
-    let mut response = fetch(browser, action, body.clone()).await?;
-    if matches!(response["status"].as_u64(), Some(401 | 440)) {
+    let mut response = fetch(browser, config, action, body.clone()).await?;
+    if matches!(action, "FindItem" | "GetItem")
+        && matches!(response["status"].as_u64(), Some(401 | 440))
+    {
         // One bounded renewal via the real Outlook login/SSO flow, never an MFA bypass.
         browser.authenticate(config).await?;
-        response = fetch(browser, action, body).await?;
+        response = fetch(browser, config, action, body).await?;
     }
     if action == "GetItem"
         && (response["error"] == "size"
@@ -290,6 +299,268 @@ pub async fn read(browser: &mut Browser, config: &Config, id: &str) -> Result<Ma
         .and_then(|a| a.first())
         .context("OWA returned no message")?;
     parse_mail(item)
+}
+
+pub fn validate_change_key(change_key: &str) -> Result<()> {
+    anyhow::ensure!(
+        !change_key.trim().is_empty()
+            && change_key.len() <= 8192
+            && !change_key.chars().any(char::is_control),
+        "invalid_change_key: provide the current OWA ChangeKey"
+    );
+    Ok(())
+}
+
+fn validate_action(config: &Config, action: &str, payload: &Value) -> Result<()> {
+    match action {
+        "FindItem" | "GetItem" => return Ok(()),
+        "CreateItem" | "UpdateItem" => config.mail_write_policy.require_drafts()?,
+        _ => bail!(
+            "Unsupported OWA action; sending, moving, deleting and read-state changes are disabled"
+        ),
+    }
+    anyhow::ensure!(
+        payload["Body"]["MessageDisposition"] == "SaveOnly",
+        "Only SaveOnly draft writes are permitted"
+    );
+    if action == "CreateItem" {
+        anyhow::ensure!(
+            payload["Body"]["SavedItemFolderId"]["BaseFolderId"]["Id"] == "drafts",
+            "Draft writes must target Drafts"
+        );
+        anyhow::ensure!(
+            payload["Body"]["Items"]
+                .as_array()
+                .is_some_and(|items| items.len() == 1),
+            "Only one draft per request is permitted"
+        );
+    } else {
+        anyhow::ensure!(
+            payload["Body"]["ConflictResolution"] == "NeverOverwrite",
+            "Draft updates must reject conflicts"
+        );
+        let changes = payload["Body"]["ItemChanges"]
+            .as_array()
+            .filter(|changes| changes.len() == 1)
+            .context("Only one draft update is permitted")?;
+        validate_change_key(
+            changes[0]["ItemId"]["ChangeKey"]
+                .as_str()
+                .unwrap_or_default(),
+        )?;
+        let updates = changes[0]["Updates"]
+            .as_array()
+            .context("Missing draft updates")?;
+        anyhow::ensure!(
+            updates.len() == 5
+                && updates
+                    .iter()
+                    .all(|update| update["__type"] == "SetItemField:#Exchange"
+                        && [
+                            "MimeContent",
+                            "Subject",
+                            "ToRecipients",
+                            "CcRecipients",
+                            "BccRecipients"
+                        ]
+                        .contains(&update["Path"]["FieldURI"].as_str().unwrap_or_default())),
+            "Only draft content and recipient updates are permitted"
+        );
+    }
+    Ok(())
+}
+
+struct DraftSnapshot {
+    change_key: String,
+    mime: Vec<u8>,
+}
+
+fn draft_read_request(id: &str) -> Result<Value> {
+    let mut payload = read_request(id)?;
+    payload["Body"]["ItemShape"]["IncludeMimeContent"] = json!(true);
+    Ok(payload)
+}
+
+fn parse_draft(value: &Value, id: &str, template: bool) -> Result<DraftSnapshot> {
+    let messages = response_messages(value)?;
+    let item = messages
+        .first()
+        .and_then(|m| m["Items"].as_array())
+        .and_then(|items| items.first())
+        .context("OWA returned no draft")?;
+    anyhow::ensure!(
+        item.pointer("/ItemId/Id").and_then(Value::as_str) == Some(id),
+        "OWA returned a different draft"
+    );
+    anyhow::ensure!(
+        item["IsDraft"] == true,
+        "not_a_draft: only unsent drafts can be used or updated"
+    );
+    if template {
+        for field in ["ToRecipients", "CcRecipients", "BccRecipients"] {
+            anyhow::ensure!(
+                item[field].is_null() || item[field].as_array().is_some_and(Vec::is_empty),
+                "signature_template_has_recipients: use a signature-only Outlook draft without recipients"
+            );
+        }
+    }
+    let change_key = item
+        .pointer("/ItemId/ChangeKey")
+        .and_then(Value::as_str)
+        .context("Draft has no ChangeKey")?
+        .to_owned();
+    validate_change_key(&change_key)?;
+    let content = item
+        .pointer("/MimeContent/Value")
+        .or_else(|| item.get("MimeContent"))
+        .and_then(Value::as_str)
+        .context("OWA returned no draft MIME; draft compatibility needs checking")?;
+    anyhow::ensure!(content.len() <= 14 * 1024 * 1024, "draft_mime_too_large");
+    let mime = STANDARD
+        .decode(content)
+        .map_err(|_| anyhow::anyhow!("invalid_draft_mime"))?;
+    Ok(DraftSnapshot { change_key, mime })
+}
+
+async fn read_draft(
+    browser: &mut Browser,
+    config: &Config,
+    id: &str,
+    template: bool,
+) -> Result<DraftSnapshot> {
+    let value = request(browser, config, "GetItem", draft_read_request(id)?).await?;
+    parse_draft(&value, id, template)
+}
+
+fn draft_fields(email: &crate::compose::PreparedEmail, mime: &[u8]) -> Value {
+    let recipients = |addresses: &[String]| {
+        addresses.iter().map(|address| json!({"__type":"EmailAddressWrapper:#Exchange","Mailbox":{"__type":"EmailAddress:#Exchange","EmailAddress":address,"RoutingType":"SMTP"}})).collect::<Vec<_>>()
+    };
+    json!({"__type":"Message:#Exchange", "MimeContent":{"__type":"MimeContent:#Exchange","Value":STANDARD.encode(mime)}, "Subject":email.subject,"ToRecipients":recipients(&email.to),"CcRecipients":recipients(&email.cc),"BccRecipients":recipients(&email.bcc)})
+}
+
+fn create_draft_request(fields: Value) -> Value {
+    envelope(
+        "CreateItem",
+        json!({"__type":"CreateItemRequest:#Exchange","MessageDisposition":"SaveOnly","SavedItemFolderId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":{"__type":"DistinguishedFolderId:#Exchange","Id":"drafts"}},"Items":[fields]}),
+    )
+}
+
+fn update_draft_request(id: &str, change_key: &str, fields: Value) -> Result<Value> {
+    read_request(id)?;
+    validate_change_key(change_key)?;
+    let updates = ["MimeContent", "Subject", "ToRecipients", "CcRecipients", "BccRecipients"].into_iter().map(|field| {
+        let mut item = json!({"__type":"Message:#Exchange"});
+        item[field] = fields[field].clone();
+        json!({"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":field},"Item":item})
+    }).collect::<Vec<_>>();
+    Ok(envelope(
+        "UpdateItem",
+        json!({"__type":"UpdateItemRequest:#Exchange","MessageDisposition":"SaveOnly","ConflictResolution":"NeverOverwrite","ItemChanges":[{"__type":"ItemChange:#Exchange","ItemId":{"__type":"ItemId:#Exchange","Id":id,"ChangeKey":change_key},"Updates":updates}]}),
+    ))
+}
+
+/// Never retries writes, even after an authentication failure or an ambiguous network error.
+pub async fn create_draft(
+    browser: &mut Browser,
+    config: &Config,
+    input: &EmailInput,
+    signature_draft_id: &str,
+) -> Result<Value> {
+    config.mail_write_policy.require_drafts()?;
+    let email = prepare(input)?;
+    let template = read_draft(browser, config, signature_draft_id, true).await?;
+    let signature = Signature::from_mime(&template.mime)?;
+    let mime = signature.mime(&email)?;
+    save_draft(
+        browser,
+        config,
+        "CreateItem",
+        create_draft_request(draft_fields(&email, &mime)),
+        None,
+        &mime,
+    )
+    .await
+}
+
+pub async fn update_draft(
+    browser: &mut Browser,
+    config: &Config,
+    input: &EmailInput,
+    signature_draft_id: &str,
+    id: &str,
+    change_key: &str,
+) -> Result<Value> {
+    config.mail_write_policy.require_drafts()?;
+    anyhow::ensure!(id != signature_draft_id, "signature_template_is_read_only");
+    validate_change_key(change_key)?;
+    let email = prepare(input)?;
+    let current = read_draft(browser, config, id, false).await?;
+    anyhow::ensure!(
+        current.change_key == change_key,
+        "draft_conflict: the draft changed; read it again before updating"
+    );
+    let template = read_draft(browser, config, signature_draft_id, true).await?;
+    let signature = Signature::from_mime(&template.mime)?;
+    signature.check_existing_images(&current.mime)?;
+    let mime = signature.mime(&email)?;
+    save_draft(
+        browser,
+        config,
+        "UpdateItem",
+        update_draft_request(id, change_key, draft_fields(&email, &mime))?,
+        Some(id),
+        &mime,
+    )
+    .await
+}
+
+async fn save_draft(
+    browser: &mut Browser,
+    config: &Config,
+    action: &str,
+    payload: Value,
+    expected_id: Option<&str>,
+    mime: &[u8],
+) -> Result<Value> {
+    let response = request(browser, config, action, payload).await.context("draft_save_unconfirmed: inspect Outlook Drafts before retrying; writes are never retried automatically")?;
+    let messages = response_messages(&response).map_err(|error| {
+        let rejection = response.pointer("/Body/ResponseMessages/Items")
+            .and_then(Value::as_array)
+            .filter(|messages| messages.len() == 1)
+            .and_then(|messages| {
+                let message = &messages[0];
+                (message["ResponseClass"] == "Error")
+                    .then(|| message["ResponseCode"].as_str())
+                    .flatten()
+            });
+        error.context(match rejection {
+            Some("ErrorIrresolvableConflict" | "ErrorChangeKeyRequired" | "ErrorInvalidChangeKey" | "ErrorChangeKeyRequiredForWriteOperations") => "draft_conflict: the server rejected the stale version; read the draft again before updating",
+            Some("ErrorAccessDenied" | "ErrorInvalidProperty" | "ErrorInvalidPropertySet" | "ErrorInvalidPropertyRequest" | "ErrorInvalidRecipients" | "ErrorInvalidIdMalformed" | "ErrorItemNotFound" | "ErrorInvalidRequest") => "draft_save_rejected: OWA refused the draft write",
+            _ => "draft_save_unconfirmed: inspect Outlook Drafts before retrying",
+        })
+    })?;
+    let item = messages.first().and_then(|m| m["Items"].as_array()).and_then(|items| items.first()).context("draft_save_unconfirmed: no saved item returned; inspect Outlook Drafts before retrying")?;
+    let id = item.pointer("/ItemId/Id").and_then(Value::as_str).context(
+        "draft_save_unconfirmed: no saved ID returned; inspect Outlook Drafts before retrying",
+    )?;
+    read_request(id)?;
+    anyhow::ensure!(
+        expected_id.is_none_or(|expected| expected == id),
+        "draft_save_unconfirmed: OWA returned a different item; inspect Outlook Drafts"
+    );
+    let mut change_key = item
+        .pointer("/ItemId/ChangeKey")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut verified = false;
+    if let Ok(saved) = read_draft(browser, config, id, false).await {
+        change_key = Some(saved.change_key);
+        verified = crate::draft::verify_saved(mime, &saved.mime).is_ok();
+    }
+    Ok(
+        json!({"id":id,"change_key":change_key,"is_draft":true,"saved":true,"verified":verified,"warning":if verified { None } else { Some("The draft was saved, but HTML/text and image preservation could not be verified. Review it in Outlook; do not create another copy automatically.") }}),
+    )
 }
 
 fn response_messages(value: &Value) -> Result<&Vec<Value>> {
@@ -361,6 +632,11 @@ fn parse_mail(item: &Value) -> Result<Mail> {
             .and_then(Value::as_str)
             .context("Message has no OWA ItemId")?
             .to_owned(),
+        change_key: item
+            .pointer("/ItemId/ChangeKey")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        is_draft: item["IsDraft"].as_bool(),
         subject: item["Subject"]
             .as_str()
             .unwrap_or("(no subject)")
@@ -383,6 +659,67 @@ fn parse_mail(item: &Value) -> Result<Mail> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn write_transport_requires_explicit_draft_policy_and_save_only_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::new(
+            Some(directory.path().join("unused")),
+            None,
+            crate::config::DEFAULT_URL,
+            false,
+            1,
+        )
+        .unwrap();
+        let fields = json!({"__type":"Message:#Exchange","MimeContent":{"Value":"fixture"},"Subject":"Synthetic","ToRecipients":[],"CcRecipients":[],"BccRecipients":[]});
+        let create = create_draft_request(fields.clone());
+        assert!(validate_action(&config, "CreateItem", &create).is_err());
+        config.mail_write_policy = crate::config::MailWritePolicy::Drafts;
+        validate_action(&config, "CreateItem", &create).unwrap();
+        let update = update_draft_request("draft-fixture", "version-fixture", fields).unwrap();
+        validate_action(&config, "UpdateItem", &update).unwrap();
+        for disposition in ["SendOnly", "SendAndSaveCopy"] {
+            let mut payload = create.clone();
+            payload["Body"]["MessageDisposition"] = json!(disposition);
+            assert!(validate_action(&config, "CreateItem", &payload).is_err());
+        }
+        let mut wrong_folder = create;
+        wrong_folder["Body"]["SavedItemFolderId"]["BaseFolderId"]["Id"] = json!("sentitems");
+        assert!(validate_action(&config, "CreateItem", &wrong_folder).is_err());
+        let mut mark_read = update.clone();
+        mark_read["Body"]["ItemChanges"][0]["Updates"][0]["Path"]["FieldURI"] = json!("IsRead");
+        assert!(validate_action(&config, "UpdateItem", &mark_read).is_err());
+        let mut overwrite = update;
+        overwrite["Body"]["ConflictResolution"] = json!("AlwaysOverwrite");
+        assert!(validate_action(&config, "UpdateItem", &overwrite).is_err());
+        for action in ["SendItem", "DeleteItem", "MoveItem", "Execute"] {
+            assert!(validate_action(&config, action, &json!({})).is_err());
+        }
+        assert!(!config.data_dir.exists());
+    }
+
+    #[test]
+    fn draft_reads_require_the_requested_unsent_item_and_a_valid_version() {
+        let fixture = json!({"Body":{"ResponseMessages":{"Items":[{"ResponseClass":"Success","ResponseCode":"NoError","Items":[{"ItemId":{"Id":"fixture","ChangeKey":"version"},"IsDraft":true,"ToRecipients":[],"MimeContent":{"Value":STANDARD.encode(crate::draft::tests::TEMPLATE)}}]}]}}});
+        let parsed = parse_draft(&fixture, "fixture", true).unwrap();
+        assert_eq!(parsed.change_key, "version");
+        assert!(parse_draft(&fixture, "other", true).is_err());
+        let mut sent = fixture.clone();
+        sent["Body"]["ResponseMessages"]["Items"][0]["Items"][0]["IsDraft"] = json!(false);
+        assert!(parse_draft(&sent, "fixture", false).is_err());
+        let mut addressed = fixture.clone();
+        addressed["Body"]["ResponseMessages"]["Items"][0]["Items"][0]["BccRecipients"] =
+            json!([{"Mailbox":{"EmailAddress":"secret@example.test"}}]);
+        assert!(parse_draft(&addressed, "fixture", true).is_err());
+        assert!(parse_draft(&addressed, "fixture", false).is_ok());
+        let mut no_version = fixture;
+        no_version["Body"]["ResponseMessages"]["Items"][0]["Items"][0]["ItemId"]["ChangeKey"] =
+            json!("");
+        assert!(parse_draft(&no_version, "fixture", true).is_err());
+        assert!(validate_change_key("secret\nkey").is_err());
+        let request = draft_read_request("fixture").unwrap();
+        assert_eq!(request["Body"]["ItemShape"]["IncludeMimeContent"], true);
+        assert!(!request.to_string().contains("IsRead"));
+    }
     #[test]
     fn mime_export_preserves_bytes_and_does_not_change_read_state() {
         let missing = json!({"Body":{"ResponseMessages":{"Items":[{"ResponseCode":"NoError","Items":[{"ItemId":{"Id":"fixture"}}]}]}}});

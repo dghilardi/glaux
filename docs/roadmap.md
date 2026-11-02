@@ -9,6 +9,7 @@
 - Online status, local diagnostics and local session removal; one data directory per account.
 - Cross-process profile lock and serialized MCP calls.
 - MCP stdio server with `list_messages` and `read_message`.
+- Local `preview_email`, with semantic HTML validation and derived plain text. Experimental opt-in `create_draft`/`update_draft` use an Outlook signature template; recipient-free create/update passed on one live session, with the [full checklist still incomplete](live-validation.md#recorded-validation-2026-11-02).
 - MIME export to private EML files and a local archive classified by header rules.
 - Repeatable sync with a persisted cursor, integrity checks, polling with backoff and an optional systemd user unit.
 - Optional unattended passkey sign-in with an external authenticator gated on the session lock.
@@ -22,4 +23,4 @@
 5. **MCP over HTTP:** local authenticated transport with origin protection before any network exposure.
 6. **Distribution:** release binaries and packages, multi-platform CI.
 
-Sending, moving and deleting mail are out of scope for now. A Microsoft Graph backend could implement the same data model behind the same interface.
+Sending, moving and deleting mail are out of scope for now. Drafts are an explicit opt-in and never enable sending. Automatic roaming-signature discovery, reply/forward composition and MJML are not implemented. A Microsoft Graph backend could implement the same data model behind the same interface.

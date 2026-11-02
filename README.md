@@ -11,13 +11,13 @@ Glaux is named after the Greek word for owl. It was inspired by [Owl for Exchang
 
 Early prototype (0.1.0), tested on Linux with Chromium against one commercial Microsoft 365 tenant. It works there for listing, reading, MIME export, a local EML archive and MCP access. Other tenants, operating systems, Exchange on-premises and government clouds are untested.
 
-Scope is deliberately **read-only**: Glaux only issues OWA `FindItem` and `GetItem`. It never sends, deletes, moves or marks messages as read.
+Mailbox access is **read-only by default** (`FindItem` and `GetItem`). Experimental, explicitly enabled [draft composition](docs/composing.md) adds `CreateItem`/`UpdateItem` with `SaveOnly`; recipient-free creation and updates passed on one live session, with [remaining validation limits](docs/live-validation.md#recorded-validation-2026-11-02). Glaux never sends, deletes, moves or marks messages as read.
 
 ## How it works
 
 1. `glaux login` opens Chromium with a dedicated profile outside your personal browser. You sign in to Microsoft yourself, including MFA.
 2. Glaux watches Outlook's own requests through the Chrome DevTools Protocol on loopback and keeps the authenticated request context in memory only.
-3. Later commands reopen the same profile headless, let Outlook refresh its session through normal SSO, and issue read-only OWA calls from inside the page.
+3. Later commands reopen the same profile headless, let Outlook refresh its session through normal SSO, and issue bounded OWA calls from inside the page according to the configured write policy.
 
 Glaux never sees your password and never writes tokens to disk. Session lifetime is decided by Microsoft and your tenant; see [session and security](docs/security.md).
 
@@ -72,6 +72,7 @@ Global flags (each also has an environment variable):
 | `--data-dir PATH` | `GLAUX_DATA_DIR` | Private profile directory; use one per account |
 | `--url URL` | `GLAUX_OWA_URL` | Start page, default `https://outlook.office.com/mail/` |
 | `--passkey-account EMAIL` | `GLAUX_PASSKEY_ACCOUNT` | Optional unattended passkey sign-in, see [passkey](docs/passkey.md) |
+| `--mail-write-policy read-only\|drafts` | `GLAUX_MAIL_WRITE_POLICY` | Read-only by default; opt in to unsent drafts, never sending |
 | `--headed` | | Show the browser for every command |
 | `--timeout SECONDS` | | Authentication wait, 1–900 |
 | `--json` | | Force JSON output |
@@ -80,7 +81,7 @@ Allowed Outlook hosts are `outlook.office.com`, `outlook.office365.com` and `out
 
 ## MCP
 
-Glaux exposes two read-only tools over stdio with the official Rust SDK: `list_messages` (`folder`, `limit`, `offset`) and `read_message` (`id`). It does not expose sign-in, sending, scripts or arbitrary requests. Run `glaux login` first, then configure your client:
+Glaux exposes three read-only tools over stdio with the official Rust SDK: `list_messages` (`folder`, `limit`, `offset`), `read_message` (`id`) and `preview_email` (local semantic HTML validation and derived text). Opting in to `--mail-write-policy drafts` also exposes `create_draft` and `update_draft`, using a signature-only Outlook draft as a template; see [composition and configuration](docs/composing.md). It does not expose sign-in, sending, scripts or arbitrary requests. Run `glaux login` before mailbox access, then configure your client:
 
 ```json
 {
