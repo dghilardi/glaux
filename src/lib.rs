@@ -45,14 +45,16 @@ pub enum Operation {
     Status,
 }
 
-/// Every operation closes Chromium gracefully, including authentication/OWA errors.
-pub async fn execute(config: &config::Config, operation: Operation) -> Result<Value> {
-    // Validate before opening a browser or accessing an account.
-    match &operation {
+/// Validate locally, before profile access or forwarding to the session owner.
+pub(crate) fn validate_operation(
+    config: &config::Config,
+    operation: &Operation,
+) -> Result<Option<Value>> {
+    match operation {
         Operation::PreviewEmail { email } => {
-            return Ok(
+            return Ok(Some(
                 json!({"email":compose::prepare(email)?,"signature":"not_applied","warnings":["Local preview excludes the Outlook template signature and images; these are included when saving a draft."]}),
-            );
+            ));
         }
         Operation::CreateDraft {
             email,
@@ -94,6 +96,68 @@ pub async fn execute(config: &config::Config, operation: Operation) -> Result<Va
         }
         Operation::Status => {}
     }
+    Ok(None)
+}
+
+/// Execute against the caller's authenticated browser without taking ownership of it.
+pub(crate) async fn execute_in_browser(
+    config: &config::Config,
+    browser: &mut browser::Browser,
+    operation: Operation,
+) -> Result<Value> {
+    if let Some(local) = validate_operation(config, &operation)? {
+        return Ok(local);
+    }
+    match operation {
+        Operation::PreviewEmail { .. } => unreachable!(),
+        Operation::CreateDraft {
+            email,
+            signature_draft_id,
+        } => owa::create_draft(browser, config, &email, &signature_draft_id).await,
+        Operation::UpdateDraft {
+            email,
+            signature_draft_id,
+            id,
+            change_key,
+        } => {
+            owa::update_draft(
+                browser,
+                config,
+                &email,
+                &signature_draft_id,
+                &id,
+                &change_key,
+            )
+            .await
+        }
+        Operation::List {
+            folder,
+            limit,
+            offset,
+        } => Ok(serde_json::to_value(
+            owa::list(browser, config, &folder, limit, offset).await?,
+        )?),
+        Operation::Read { id } => Ok(serde_json::to_value(
+            owa::read(browser, config, &id).await?,
+        )?),
+        Operation::Export { id, output } => {
+            let bytes = owa::read_mime(browser, config, &id).await?;
+            export::publish(&output, &bytes)?;
+            Ok(json!({"exported":true,"bytes":bytes.len(),"format":"eml"}))
+        }
+        Operation::Status => {
+            // Observing a bearer alone isn't proof that mailbox reads work.
+            owa::list(browser, config, "inbox", 1, 0).await?;
+            Ok(json!({"authenticated":true,"mailbox_readable":true}))
+        }
+    }
+}
+
+/// Every standalone operation closes Chromium on success, errors and signals.
+pub async fn execute(config: &config::Config, operation: Operation) -> Result<Value> {
+    if let Some(local) = validate_operation(config, &operation)? {
+        return Ok(local);
+    }
     let mut shutdown = shutdown::Shutdown::new()?;
     let mut browser = browser::Browser::launch(config, config.headed).await?;
     let result = tokio::select! {
@@ -101,27 +165,7 @@ pub async fn execute(config: &config::Config, operation: Operation) -> Result<Va
         _ = shutdown.wait() => Err(anyhow::anyhow!("Operation interrupted")),
         result = async {
             browser.authenticate(config).await?;
-            match operation {
-                Operation::PreviewEmail { .. } => unreachable!(),
-                Operation::CreateDraft { email, signature_draft_id } => {
-                    owa::create_draft(&mut browser, config, &email, &signature_draft_id).await
-                },
-                Operation::UpdateDraft { email, signature_draft_id, id, change_key } => {
-                    owa::update_draft(&mut browser, config, &email, &signature_draft_id, &id, &change_key).await
-                },
-                Operation::List { folder, limit, offset } => Ok(serde_json::to_value(owa::list(&mut browser, config, &folder, limit, offset).await?)?),
-                Operation::Read { id } => Ok(serde_json::to_value(owa::read(&mut browser, config, &id).await?)?),
-                Operation::Export { id, output } => {
-                    let bytes = owa::read_mime(&mut browser, config, &id).await?;
-                    export::publish(&output, &bytes)?;
-                    Ok(json!({"exported":true,"bytes":bytes.len(),"format":"eml"}))
-                },
-                Operation::Status => {
-                    // Observing a bearer alone isn't proof that mailbox reads work.
-                    owa::list(&mut browser, config, "inbox", 1, 0).await?;
-                    Ok(json!({"authenticated":true,"mailbox_readable":true}))
-                },
-            }
+            execute_in_browser(config, &mut browser, operation).await
         } => result,
     };
     browser.shutdown().await;
