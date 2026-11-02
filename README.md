@@ -13,7 +13,7 @@ Early prototype (0.1.0), tested on Linux with Chromium against one commercial Mi
 
 Mailbox access is **read-only by default** (`FindItem` and `GetItem`). Experimental, explicitly enabled [draft composition](docs/composing.md) adds `CreateItem`/`UpdateItem` with `SaveOnly`; recipient-free creation and updates passed on one live session, with [remaining validation limits](docs/live-validation.md#recorded-validation-2026-11-02). Glaux never sends, deletes, moves or marks messages as read.
 
-On Unix, CLI and MCP automatically share the running daemon's browser through a private local socket, so archiving can continue while clients use the mailbox. Without a daemon they use a standalone browser. Drafts require opt-in permission in both the client and daemon. Shared-service live validation is still pending; see [architecture](docs/architecture.md#shared-mailbox-service).
+On Unix, CLI and MCP automatically share the running daemon's browser through a private local socket, so archiving can continue while clients use the mailbox. Without a daemon they use a standalone browser. Drafts require opt-in permission in both the client and daemon. Shared-service reads passed on one live Linux session, including concurrent clients; see the [remaining validation limits](docs/live-validation.md#shared-daemon-validation).
 
 ## How it works
 

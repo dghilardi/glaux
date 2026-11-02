@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- Document successful live read-only validation of the shared mailbox service on Linux, including concurrent CLI/MCP clients.
+
 ## [0.5.0] 2026-11-02
 
 ### Added
