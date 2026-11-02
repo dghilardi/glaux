@@ -1,6 +1,6 @@
 [package]
 name = "glaux"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Microsoft 365 mail and opt-in drafts from the terminal and MCP, through Outlook on the web"

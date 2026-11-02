@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.7.0] 2026-11-02
+
 ### Added
 
 - Local email theme configuration shared by CLI and MCP, with separate text, heading, link, border and decorative colors, per-email overrides and contrast validation. Recipient-free live MCP creation and update passed with an unchanged signature template.
