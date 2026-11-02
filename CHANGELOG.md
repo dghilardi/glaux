@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
-- Controlled inline email presentation shared by previews and drafts, with a configurable high-contrast accent, readable typography and preserved data tables; signature formatting remains separate. Recipient-free live OWA creation and content readback passed on one session; the owner confirmed the rendered draft and signature look correct in Outlook. Other clients and dark mode remain unverified.
+- Controlled inline email presentation shared by previews and drafts, with a configurable high-contrast accent, readable typography and preserved data tables; signature formatting remains separate. Recipient-free live OWA creation and content readback passed on one session; the owner confirmed the rendered draft and signature look correct in Outlook. External synthetic screenshots also cover representative mobile, web and dark-mode clients, with remaining classic Outlook layout limitations documented.
 
 ### Changed
 

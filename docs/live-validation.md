@@ -97,7 +97,7 @@ The template used external HTTPS images, so live CID image preservation remains 
 
 The inline renderer is covered by synthetic composition, MIME readback and CLI/MCP tests. A native Chromium fixture checks 375, 600 and 1024 px viewports without external resources. These checks do not establish live tenant or mail-client rendering compatibility.
 
-On 2026-11-02, branch commit `642159e` was exercised against one real OWA session through a temporary daemon executable, then the installed 0.5.0 daemon was restored and confirmed active. One recipient-free draft with synthetic body text was created through MCP and returned `saved: true`, `verified: true`, `is_draft: true`. Subsequent read-only MIME checks confirmed empty recipient headers, no ordinary attachments, retained renderer width/font styles, matching signature text/links/image references and matching inline image bytes. The initial validation runner did not complete its strict template byte-identity check; template byte identity across the write is not established by this run. No template update or send operation was issued. The owner subsequently confirmed that headings, spacing, the table, links and the signature with its logo looked correct in Outlook. The specific Outlook variant was not recorded; other clients and dark mode remain unverified.
+On 2026-11-02, branch commit `642159e` was exercised against one real OWA session through a temporary daemon executable, then the installed 0.5.0 daemon was restored and confirmed active. One recipient-free draft with synthetic body text was created through MCP and returned `saved: true`, `verified: true`, `is_draft: true`. Subsequent read-only MIME checks confirmed empty recipient headers, no ordinary attachments, retained renderer width/font styles, matching signature text/links/image references and matching inline image bytes. The initial validation runner did not complete its strict template byte-identity check; template byte identity across the write is not established by this run. No template update or send operation was issued. The owner subsequently confirmed that headings, spacing, the table, links and the signature with its logo looked correct in Outlook. The specific Outlook variant was not recorded; this owner confirmation alone does not establish other clients or dark-mode behavior. External synthetic coverage is recorded below.
 
 Before declaring the new presentation validated for a deployment:
 
@@ -108,3 +108,22 @@ Before declaring the new presentation validated for a deployment:
 - [ ] Inspect target desktop and mobile mail clients, including dark mode; record the exact clients checked. Do not infer support from Chromium screenshots.
 
 Use synthetic body text for this validation and never record mailbox identifiers, addresses or message contents in this checklist. Sending mail requires separate explicit authorization.
+
+### External screenshot check, 2026-11-02
+
+A single anonymous Unspam Device Preview test accepted the [synthetic HTML fixture](validation/email-renderer-2026-11-02.html) without an account, card or mailbox connection. The authored body was produced by branch commit `642159e`; its signature, name, organization, links and externally hosted placeholder logo were synthetic. No real message or signature was uploaded. This tests generated HTML directly, not MIME exported after Outlook saved a draft.
+
+[Preview report](https://unspam.email/client-preview/50d2829f-2b88-42b2-ac10-36db340abffb). Anonymous results have limited retention; the committed HTML preserves the exact submitted artifact (SHA-256 `7c9a5dd3876a69afbb03927b17fcc6237f76b1bc5f6160f8f01662cfcf25cb7a`). The report initially listed 48 targets, then adjusted the total to 44; not every queued target had completed when the representative screenshots were reviewed. Do not treat the listed client count as a passed test count.
+
+Screenshots were visually inspected for these provider-labelled targets:
+
+| Target | Observation |
+| --- | --- |
+| iPhone 11 | Readable headings, bullets, table, wrapped link, separate code lines and synthetic signature/logo. |
+| Android 9 | Readable body, table, wrapped link, separate code lines and synthetic signature/logo. |
+| Gmail (Firefox) | Readable body with expected spacing, bullets, table, code lines and logo. |
+| Outlook.com dark mode (Chrome) | Client inverts the palette; text, links and table remain visible in this sample. |
+| Apple Mail dark mode | Body keeps a white background; content remains readable, but the two preformatted lines appear joined. |
+| Microsoft Outlook 2016 / 2019 | Body/table extend beyond the intended maximum width, list markers are missing, table typography differs and preformatted lines appear joined. Content and logo remain visible. |
+
+These are observed screenshots, not automated pixel comparisons or certification of the whole client family. The classic Outlook discrepancies remain unresolved and should be addressed and retested before claiming equivalent presentation across clients. Arbitrary themes, complex tables, CID images and the actual corporate signature were not exercised by this external test.
